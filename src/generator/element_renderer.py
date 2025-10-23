@@ -45,9 +45,19 @@ class ElementRenderer:
         # Clean content - remove control characters for XML compatibility
         if isinstance(content, str):
             # Remove NULL bytes and control characters except tab, newline, carriage return
-            content = ''.join(c for c in content if ord(c) >= 32 or c in '\t\n\r')
+            # Also handle special Unicode characters that might cause issues
+            cleaned = []
+            for c in content:
+                code = ord(c)
+                # Allow printable characters, tab, newline, carriage return
+                if code >= 32 or c in '\t\n\r':
+                    # Skip private use area and other problematic ranges
+                    if code < 0xE000 or code > 0xF8FF:  # Skip private use area
+                        if code < 0xD800 or code > 0xDFFF:  # Skip surrogates
+                            cleaned.append(c)
+            content = ''.join(cleaned)
         
-        if not content:
+        if not content or not content.strip():
             return None
         
         # Create text box
