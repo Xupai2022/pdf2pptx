@@ -134,17 +134,35 @@ class StyleMapper:
             
             # Stroke/line color and width
             stroke_color = style.get('stroke_color')
-            stroke_width = style.get('stroke_width', 1)
+            stroke_width = style.get('stroke_width')
             
-            if stroke_color and stroke_color != 'None' and self.preserve_colors:
+            # Determine if border should be rendered
+            # Border should NOT be rendered if:
+            # 1. stroke_width is None or 0
+            # 2. stroke_color is None or "None" string
+            # 3. stroke_color is default black (#000000) AND stroke_width is None (PDF default)
+            should_render_border = False
+            
+            if stroke_color and stroke_color not in ['None', '#000000']:
+                # Explicit non-black stroke color
+                if stroke_width is not None and stroke_width > 0:
+                    should_render_border = True
+            elif stroke_color == '#000000' and stroke_width is not None and stroke_width > 0:
+                # Black stroke with explicit width
+                should_render_border = True
+            
+            if should_render_border and self.preserve_colors:
                 rgb = self.hex_to_rgb(stroke_color)
                 shape.line.color.rgb = RGBColor(*rgb)
-                if stroke_width and isinstance(stroke_width, (int, float)):
-                    # Apply PDF scale correction: PDF border 3pt → HTML 4px means multiply by 1.333
-                    # At 72 DPI: 4px = 4pt in PowerPoint
-                    scaled_width = stroke_width * self.font_size_scale
-                    shape.line.width = Pt(scaled_width)
-                    logger.debug(f"Stroke width: {stroke_width}pt → {scaled_width}pt (scaled)")
+                # Apply PDF scale correction: PDF border 3pt → HTML 4px means multiply by 1.333
+                # At 72 DPI: 4px = 4pt in PowerPoint
+                scaled_width = stroke_width * self.font_size_scale
+                shape.line.width = Pt(scaled_width)
+                logger.debug(f"Stroke width: {stroke_width}pt → {scaled_width}pt (scaled)")
+            else:
+                # No border - make line transparent/invisible
+                shape.line.fill.background()
+                logger.debug(f"No border: stroke_color={stroke_color}, stroke_width={stroke_width}")
         except Exception as e:
             logger.warning(f"Failed to apply shape style: {e}", exc_info=True)
     

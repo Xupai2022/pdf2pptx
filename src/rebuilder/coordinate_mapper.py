@@ -81,8 +81,13 @@ class CoordinateMapper:
         
         if role in ['title', 'subtitle', 'heading', 'text', 'paragraph', 'header', 'footer']:
             # Process text content
+            # The layout analyzer has already grouped text elements correctly
+            # We just need to convert the region to a textbox
+            
+            # Use pre-merged text from analyzer if available
             text = region.get('text', '')
             if not text:
+                # Fallback: merge element text manually
                 text = self._merge_element_text(elements)
             
             if text:

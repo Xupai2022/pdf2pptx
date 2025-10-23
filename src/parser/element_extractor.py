@@ -143,6 +143,50 @@ class ElementExtractor:
         return lines
     
     @staticmethod
+    def group_close_elements(line_elements: List[Dict[str, Any]], 
+                            gap_tolerance: float = 1.0) -> List[List[Dict[str, Any]]]:
+        """
+        Group elements on the same line that are very close together (gap ≤ tolerance).
+        This handles cases where Chinese characters and numbers are split into separate elements.
+        
+        Args:
+            line_elements: List of text elements on the same line (sorted by x)
+            gap_tolerance: Maximum gap in points to consider elements as part of same group (default 1.0pt)
+            
+        Returns:
+            List of element groups, each group should be merged into one textbox
+        """
+        if not line_elements:
+            return []
+        
+        # Sort by x position
+        sorted_elements = sorted(line_elements, key=lambda e: e.get('x', 0))
+        
+        groups = []
+        current_group = [sorted_elements[0]]
+        prev_x2 = sorted_elements[0].get('x2', sorted_elements[0].get('x', 0))
+        
+        for elem in sorted_elements[1:]:
+            x = elem.get('x', 0)
+            gap = x - prev_x2
+            
+            # If gap is very small (≤ tolerance), they should be in same textbox
+            if gap <= gap_tolerance:
+                current_group.append(elem)
+            else:
+                # Gap is large enough, start new group
+                groups.append(current_group)
+                current_group = [elem]
+            
+            prev_x2 = elem.get('x2', elem.get('x', 0))
+        
+        # Add last group
+        if current_group:
+            groups.append(current_group)
+        
+        return groups
+    
+    @staticmethod
     def merge_text_on_line(line_elements: List[Dict[str, Any]]) -> str:
         """
         Merge text elements on the same line into a single string.

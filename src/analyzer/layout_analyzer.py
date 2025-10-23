@@ -80,16 +80,36 @@ class LayoutAnalyzer:
                 'z_index': 1  # Images typically on top
             })
         
-        # Process shape regions (backgrounds, decorations)
+        # Process shape regions (backgrounds, decorations) with intelligent role detection
         for shape_elem in shape_elements:
-            # Large shapes are likely backgrounds
-            shape_area = shape_elem['width'] * shape_elem['height']
+            shape_width = shape_elem['width']
+            shape_height = shape_elem['height']
+            shape_area = shape_width * shape_height
             page_area = page_width * page_height
             
+            # Intelligent role detection based on size, aspect ratio, and position
             if shape_area > page_area * 0.5:
+                # Very large shape covering most of page
                 role = 'background'
                 z_index = -1
+            elif shape_height > shape_width and shape_width < 10:
+                # Thin vertical shape - likely a left border
+                role = 'border'
+                z_index = 0
+            elif shape_width > shape_height and shape_height < 10:
+                # Thin horizontal shape - likely a top bar or underline
+                role = 'border'
+                z_index = 0
+            elif shape_area > 10000:  # Large card-like shapes (e.g., 426×109 = 46k)
+                # Wide rectangular cards (stat cards, data cards)
+                role = 'card_background'
+                z_index = -1
+            elif 500 < shape_area < 3000:  # Small badges (e.g., 51×25 = 1.3k, 60×25 = 1.5k)
+                # Small rectangular badges (risk level badges)
+                role = 'decoration'
+                z_index = 0
             else:
+                # Other shapes
                 role = 'decoration'
                 z_index = 0
             

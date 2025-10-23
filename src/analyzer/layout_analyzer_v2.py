@@ -173,32 +173,93 @@ class LayoutAnalyzerV2:
             elem_color = elem.get('color', '')
             
             # Look for elements on the same line or closely positioned
+            # Important: Track the rightmost x2 of the current group for gap calculation
+            current_x2 = elem_x2
+            
+            # Debug logging for specific text
+            if elem.get('content', '') in ['8', '高危', '4', '12', '19']:
+                logger.debug(f"Processing element: '{elem.get('content', '')}' at y={elem_y:.1f}, x={elem_x:.1f}-{elem_x2:.1f}")
+            
             for other in sorted_elements:
                 if id(other) in processed:
                     continue
                 
                 other_y = other.get('y', 0)
                 other_x = other.get('x', 0)
+                other_x2 = other.get('x2', 0)
                 other_font_size = other.get('font_size', 0)
                 other_color = other.get('color', '')
                 
                 # Same line criteria
                 y_diff = abs(other_y - elem_y)
-                x_gap = other_x - elem_x2
+                x_gap = other_x - current_x2
                 
                 # Group if on same line and close horizontal proximity
-                if y_diff <= self.group_tolerance and 0 <= x_gap <= self.group_tolerance * 3:
-                    # Also check style similarity
-                    if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color:
+                # Use very small gap tolerance (1pt) for tightly-coupled text like "8个", "高危4"
+                # Use larger tolerance (30pt) for related text with spacing
+                if y_diff <= self.group_tolerance:
+                    should_group = False
+                    
+                    # Very close elements (gap ≤ 1pt, allow negative for overlaps or left neighbors)
+                    # Check both directions: element could be to the left or right
+                    
+                    # Direction 1: Check if other element is directly to our RIGHT
+                    if 0 <= x_gap <= 1.0:
+                        if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color:
+                            should_group = True
+                            if elem.get('content', '') in ['8', '高危', '4', '12', '19']:
+                                logger.debug(f"  → Grouping '{other.get('content', '')}' on RIGHT (gap={x_gap:.2f}pt)")
+                    
+                    # Direction 2: Check if other element is directly to our LEFT
+                    # Calculate gap from other's right edge to our left edge
+                    elif x_gap < 0:
+                        other_x2 = other.get('x2', other_x)
+                        left_gap = elem_x - other_x2
+                        # Only group if they are adjacent (gap ≤ 1pt)
+                        if -1.0 <= left_gap <= 1.0:
+                            if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color:
+                                should_group = True
+                                if elem.get('content', '') in ['8', '高危', '4', '12', '19']:
+                                    logger.debug(f"  → Grouping '{other.get('content', '')}' on LEFT (left_gap={left_gap:.2f}pt)")
+                    elif elem.get('content', '') in ['4', '12', '19'] and y_diff <= self.group_tolerance and other.get('content', '') in ['高危', '中危', '低危']:
+                        logger.debug(f"  × Checking '{other.get('content', '')}' after '{ elem.get('content', '')}' (gap={x_gap:.2f}pt, y_diff={y_diff:.2f}pt)")
+                    # Moderate distance (1pt < gap ≤ 30pt) - group only if same style
+                    elif 1.0 < x_gap <= self.group_tolerance * 3:
+                        if other_font_size == elem_font_size and other_color == elem_color:
+                            should_group = True
+                            if elem.get('content', '') in ['8', '高危']:
+                                logger.debug(f"  → Grouping '{other.get('content', '')}' (gap={x_gap:.2f}pt, moderate)")
+                    elif elem.get('content', '') in ['8', '高危'] and y_diff <= self.group_tolerance and other.get('content', '') in ['个', '4']:
+                        logger.debug(f"  × Skipping '{other.get('content', '')}' (gap={x_gap:.2f}pt, y_diff={y_diff:.2f}pt)")
+                    
+                    if should_group:
                         group_elements.append(other)
                         processed.add(id(other))
-                        elem_x2 = max(elem_x2, other.get('x2', 0))
+                        current_x2 = max(current_x2, other_x2)
             
             # Create region
             bbox = self._calculate_bbox(group_elements)
             
-            # Merge text
-            text_content = ' '.join([e.get('content', '') for e in group_elements])
+            # Sort group elements by x position before merging text
+            sorted_group = sorted(group_elements, key=lambda e: e.get('x', 0))
+            
+            # Merge text (without spaces for elements with gap ≤ 1pt)
+            text_parts = []
+            for i, e in enumerate(sorted_group):
+                if i > 0:
+                    # Check gap with previous element
+                    prev_x2 = sorted_group[i-1].get('x2', sorted_group[i-1].get('x', 0))
+                    curr_x = e.get('x', 0)
+                    gap = curr_x - prev_x2
+                    # Add space only if gap > 1pt
+                    if gap > 1.0:
+                        text_parts.append(' ')
+                text_parts.append(e.get('content', ''))
+            text_content = ''.join(text_parts)
+            
+            # Debug logging
+            if elem.get('content', '') in ['8', '高危']:
+                logger.debug(f"Creating region: '{text_content}' with {len(group_elements)} elements: {[e.get('content', '') for e in group_elements]}")
             
             regions.append({
                 'role': role,

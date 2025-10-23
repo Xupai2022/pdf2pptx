@@ -52,4 +52,7 @@ tests/*.pptx
 # Temporary files
 *.tmp
 *.temp
+
+pdf2ppt/
 .cache/
+
