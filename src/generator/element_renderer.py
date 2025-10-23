@@ -42,22 +42,24 @@ class ElementRenderer:
         content = element.content
         style = element.style
         
-        # Clean content - remove control characters for XML compatibility
+        # Store original for comparison
+        original_content = content
+        
+        # Clean content - remove ONLY control characters that cause XML issues
         if isinstance(content, str):
-            # Remove NULL bytes and control characters except tab, newline, carriage return
-            # Also handle special Unicode characters that might cause issues
-            cleaned = []
-            for c in content:
-                code = ord(c)
-                # Allow printable characters, tab, newline, carriage return
-                if code >= 32 or c in '\t\n\r':
-                    # Skip private use area and other problematic ranges
-                    if code < 0xE000 or code > 0xF8FF:  # Skip private use area
-                        if code < 0xD800 or code > 0xDFFF:  # Skip surrogates
-                            cleaned.append(c)
-            content = ''.join(cleaned)
+            # Remove NULL bytes and problematic control characters
+            # Keep normal printable characters, whitespace, and CJK characters
+            import re
+            # Remove only C0 control characters (0x00-0x1F) except tab, newline, carriage return
+            content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', content)
+            # Remove C1 control characters (0x80-0x9F)
+            content = re.sub(r'[\x80-\x9F]', '', content)
+            # Remove Unicode non-characters (U+FDD0 - U+FDEF, U+FFFE, U+FFFF, etc.)
+            content = re.sub(r'[\uFDD0-\uFDEF\uFFFE\uFFFF]', '', content)
         
         if not content or not content.strip():
+            if original_content and original_content.strip():
+                logger.warning(f"Text cleaned away: original had {len(original_content)} chars: {repr(original_content[:50])}")
             return None
         
         # Create text box
@@ -99,6 +101,14 @@ class ElementRenderer:
             
         except Exception as e:
             logger.error(f"Failed to render text element: {e}")
+            logger.error(f"Content length: {len(content)}, first 50 chars: {repr(content[:50])}")
+            # Try to identify problematic characters
+            for i, c in enumerate(content):
+                code = ord(c)
+                if code < 32 and c not in '\t\n\r':
+                    logger.error(f"  Found control char at pos {i}: U+{code:04X} ({repr(c)})")
+                elif 0x80 <= code <= 0x9F:
+                    logger.error(f"  Found C1 control at pos {i}: U+{code:04X} ({repr(c)})")
             return None
     
     def render_image(self, slide, element: SlideElement) -> Any:
@@ -163,11 +173,18 @@ class ElementRenderer:
         width = Inches(position['width'])
         height = Inches(position['height'])
         
-        # Ensure minimum dimensions
-        if width < Inches(0.1):
-            width = Inches(0.5)
-        if height < Inches(0.1):
-            height = Inches(0.5)
+        # Ensure minimum dimensions (but allow thin borders)
+        # Check if it's a border (thin vertical or horizontal shape)
+        is_vertical_border = (position['height'] > position['width'] and position['width'] < 0.1)
+        is_horizontal_border = (position['width'] > position['height'] and position['height'] < 0.1)
+        is_border = is_vertical_border or is_horizontal_border
+        
+        if not is_border:
+            # Apply minimum size only to non-border shapes
+            if width < Inches(0.1):
+                width = Inches(0.5)
+            if height < Inches(0.1):
+                height = Inches(0.5)
         
         try:
             # Map shape type to MSO_SHAPE

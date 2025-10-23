@@ -29,6 +29,11 @@ class CoordinateMapper:
         self.margin_right = config.get('margin_right', 0.5)
         self.margin_top = config.get('margin_top', 0.5)
         self.margin_bottom = config.get('margin_bottom', 0.5)
+        # PDF scale correction (PDF is 75% of HTML, multiply by 1.333 to restore)
+        self.pdf_to_html_scale = config.get('pdf_to_html_scale', 1.0)
+        # Border width correction (PDF borders are thicker than expected)
+        self.border_width_correction = config.get('border_width_correction', 1.0)
+        logger.info(f"CoordinateMapper: slide {self.slide_width:.3f}×{self.slide_height:.3f}\", PDF scale: {self.pdf_to_html_scale}, border correction: {self.border_width_correction}")
     
     def create_slide_model(self, layout_data: Dict[str, Any]) -> SlideModel:
         """
@@ -107,16 +112,28 @@ class CoordinateMapper:
             for elem in elements:
                 if elem.get('type') == 'shape':
                     shape_type = elem.get('shape_type', 'rectangle')
+                    
+                    # Apply border width correction for thin vertical shapes (card borders)
+                    # PDF generates card borders at 5.55pt, but HTML specifies 4px
+                    elem_width = elem['x2'] - elem['x']
+                    elem_height = elem['y2'] - elem['y']
+                    is_vertical_border = (elem_height > elem_width and 4 < elem_width < 7)  # Vertical border around 5.55pt
+                    is_border = is_vertical_border
+                    if is_border:
+                        logger.debug(f"Found border shape: {elem_width:.2f} × {elem_height:.2f} pt, role={role}")
+                    
                     style = {
                         'fill_color': elem.get('fill_color'),
                         'fill_opacity': elem.get('fill_opacity', 1.0),
                         'stroke_color': elem.get('stroke_color'),
                         'stroke_width': elem.get('stroke_width', 1),
-                        'role': role  # Pass role to style for transparency mapping
+                        'role': role,  # Pass role to style for transparency mapping
+                        'is_border': is_border  # Flag for border-specific handling
                     }
                     shape_position = self._pdf_to_slide_coords(
                         [elem['x'], elem['y'], elem['x2'], elem['y2']],
-                        pdf_width, pdf_height
+                        pdf_width, pdf_height,
+                        apply_border_correction=is_border
                     )
                     slide.add_shape(shape_type, shape_position, style, z_index)
         
@@ -127,7 +144,7 @@ class CoordinateMapper:
                     slide.set_background(color=elem.get('fill_color'))
     
     def _pdf_to_slide_coords(self, bbox: list, pdf_width: float, 
-                            pdf_height: float) -> Dict[str, float]:
+                            pdf_height: float, apply_border_correction: bool = False) -> Dict[str, float]:
         """
         Convert PDF coordinates to slide coordinates.
         
@@ -135,17 +152,48 @@ class CoordinateMapper:
             bbox: Bounding box [x1, y1, x2, y2] in PDF coordinates
             pdf_width: PDF page width
             pdf_height: PDF page height
+            apply_border_correction: Apply border width correction for thin shapes
             
         Returns:
             Position dictionary with normalized coordinates
         """
         x1, y1, x2, y2 = bbox
         
-        # Normalize to 0-1 range
-        norm_x = x1 / pdf_width if pdf_width > 0 else 0
-        norm_y = y1 / pdf_height if pdf_height > 0 else 0
-        norm_w = (x2 - x1) / pdf_width if pdf_width > 0 else 0
-        norm_h = (y2 - y1) / pdf_height if pdf_height > 0 else 0
+        # Apply PDF scale correction to coordinates (PDF is 75% of HTML size)
+        # This restores PDF coordinates to HTML pixel equivalents
+        x1 *= self.pdf_to_html_scale
+        y1 *= self.pdf_to_html_scale
+        x2 *= self.pdf_to_html_scale
+        y2 *= self.pdf_to_html_scale
+        
+        # Apply border width correction for vertical card borders
+        # PDF generates card borders at 5.55pt which becomes 7.4pt after scaling
+        # HTML specifies 4px borders, so we correct to 4pt
+        if apply_border_correction and self.border_width_correction != 1.0:
+            elem_width = x2 - x1
+            elem_height = y2 - y1
+            
+            # Only correct vertical borders (height > width)
+            if elem_height > elem_width:
+                # Keep center position, adjust width to match HTML 4px
+                orig_x1, orig_x2 = x1, x2
+                center_x = (x1 + x2) / 2
+                target_width = elem_width * self.border_width_correction
+                x1 = center_x - target_width / 2
+                x2 = center_x + target_width / 2
+                logger.debug(f"Corrected border width: {elem_width:.2f}pt → {target_width:.2f}pt")
+                logger.debug(f"  Coords before: x1={orig_x1:.2f}, x2={orig_x2:.2f} (width={orig_x2-orig_x1:.2f})")
+                logger.debug(f"  Coords after:  x1={x1:.2f}, x2={x2:.2f} (width={x2-x1:.2f})")
+        
+        # Also scale the PDF dimensions
+        scaled_pdf_width = pdf_width * self.pdf_to_html_scale
+        scaled_pdf_height = pdf_height * self.pdf_to_html_scale
+        
+        # Normalize to 0-1 range (using scaled dimensions)
+        norm_x = x1 / scaled_pdf_width if scaled_pdf_width > 0 else 0
+        norm_y = y1 / scaled_pdf_height if scaled_pdf_height > 0 else 0
+        norm_w = (x2 - x1) / scaled_pdf_width if scaled_pdf_width > 0 else 0
+        norm_h = (y2 - y1) / scaled_pdf_height if scaled_pdf_height > 0 else 0
         
         # Apply margins
         content_width = self.slide_width - self.margin_left - self.margin_right
@@ -156,6 +204,10 @@ class CoordinateMapper:
         y = self.margin_top + norm_y * content_height
         width = norm_w * content_width
         height = norm_h * content_height
+        
+        if apply_border_correction:
+            logger.debug(f"  Final position (inches): x={x:.4f}, y={y:.4f}, width={width:.4f}, height={height:.4f}")
+            logger.debug(f"  In points: width={width*72:.2f}pt, height={height*72:.2f}pt")
         
         return {
             'x': x,

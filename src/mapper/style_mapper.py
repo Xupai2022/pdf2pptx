@@ -140,9 +140,11 @@ class StyleMapper:
                 rgb = self.hex_to_rgb(stroke_color)
                 shape.line.color.rgb = RGBColor(*rgb)
                 if stroke_width and isinstance(stroke_width, (int, float)):
-                    # For borders, keep pixel size (4px should be 4pt)
-                    # PowerPoint uses points, HTML uses pixels (roughly 1:1 at standard DPI)
-                    shape.line.width = Pt(stroke_width)
+                    # Apply PDF scale correction: PDF border 3pt → HTML 4px means multiply by 1.333
+                    # At 72 DPI: 4px = 4pt in PowerPoint
+                    scaled_width = stroke_width * self.font_size_scale
+                    shape.line.width = Pt(scaled_width)
+                    logger.debug(f"Stroke width: {stroke_width}pt → {scaled_width}pt (scaled)")
         except Exception as e:
             logger.warning(f"Failed to apply shape style: {e}", exc_info=True)
     

@@ -18,12 +18,21 @@ analyzer:
 
 # Coordinate Mapping Configuration
 rebuilder:
-  slide_width: 13.333  # inches (1920px at 144 DPI, 16:9 aspect ratio)
-  slide_height: 7.5  # inches (1080px at 144 DPI)
+  # PowerPoint uses 72 DPI standard
+  # PDF is generated at 75% scale (1440×811 pt), need to scale back to 1920×1080 px
+  slide_width: 26.667  # inches (1920px at 72 DPI = 1920/72 = 26.667")
+  slide_height: 15.0  # inches (1080px at 72 DPI = 1080/72 = 15")
   margin_left: 0.0  # No margins to match HTML exactly
   margin_right: 0.0
   margin_top: 0.0
   margin_bottom: 0.0
+  
+  # PDF scale correction: PDF is 75% of HTML size, multiply by 1.333 to restore
+  pdf_to_html_scale: 1.333  # 4/3 ratio to convert 1440×811 → 1920×1080
+  
+  # Border width correction: PDF has 5.55pt borders → 7.4pt after scaling, but HTML expects 4pt
+  # Correction factor: 4pt / 7.4pt = 0.54
+  border_width_correction: 0.54
 
 # Style Mapping Configuration
 mapper:
@@ -39,9 +48,10 @@ mapper:
   default_font_size: 18
   title_font_size: 32
   
-  # Font size scaling (PDF points to screen pixels)
-  # PDF extracts font sizes in points which are ~25% smaller than screen pixels
-  # Scaling factor: 1.333 (4/3) converts PDF points to match HTML pixels
+  # Font size scaling (PDF points to HTML pixels)
+  # PDF is generated at 75% scale: 36pt in PDF = 48px in HTML
+  # Scaling factor: 1.333 (4/3) converts PDF points to match HTML pixel sizes
+  # At 72 DPI: 1 pt = 1 px, so 36pt × 1.333 = 48pt in PowerPoint = 48px equivalent
   font_size_scale: 1.333
   
   # Color schemes
