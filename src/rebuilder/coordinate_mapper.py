@@ -74,19 +74,19 @@ class CoordinateMapper:
         # Convert bbox to normalized coordinates
         position = self._pdf_to_slide_coords(bbox, pdf_width, pdf_height)
         
-        if role == 'title':
-            # Process title
-            text = region.get('text', '')
-            if text:
-                slide.set_title(text)
-                style = self._extract_text_style(elements)
-                slide.add_text(text, position, style, z_index)
-        
-        elif role == 'subtitle' or role == 'paragraph':
+        if role in ['title', 'subtitle', 'heading', 'text', 'paragraph', 'header', 'footer']:
             # Process text content
-            text = self._merge_element_text(elements)
+            text = region.get('text', '')
+            if not text:
+                text = self._merge_element_text(elements)
+            
             if text:
                 style = self._extract_text_style(elements)
+                
+                # Set as title if it's a title role
+                if role == 'title':
+                    slide.set_title(text)
+                
                 slide.add_text(text, position, style, z_index)
         
         elif role == 'image':
@@ -102,7 +102,7 @@ class CoordinateMapper:
                         )
                         slide.add_image(image_data, img_position, image_format, z_index)
         
-        elif role == 'shape' or role == 'decoration':
+        elif role in ['shape', 'decoration', 'card_background', 'border']:
             # Process shape
             for elem in elements:
                 if elem.get('type') == 'shape':

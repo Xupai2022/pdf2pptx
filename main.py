@@ -15,7 +15,7 @@ from typing import Dict, Any
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.parser.pdf_parser import PDFParser
-from src.analyzer.layout_analyzer import LayoutAnalyzer
+from src.analyzer.layout_analyzer_v2 import LayoutAnalyzerV2
 from src.rebuilder.coordinate_mapper import CoordinateMapper
 from src.generator.pptx_generator import PPTXGenerator
 
@@ -102,7 +102,7 @@ def convert_pdf_to_pptx(pdf_path: str, output_path: str, config: Dict[str, Any])
         logger.info("Step 2: Analyzing Layout")
         logger.info("=" * 60)
         
-        analyzer = LayoutAnalyzer(config['analyzer'])
+        analyzer = LayoutAnalyzerV2(config['analyzer'])
         analyzed_pages = []
         
         for page_data in all_pages:
