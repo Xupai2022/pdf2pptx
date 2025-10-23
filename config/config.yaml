@@ -1,0 +1,58 @@
+# PDF to PPTX Converter Configuration
+
+# PDF Parsing Configuration
+parser:
+  dpi: 300
+  extract_images: true
+  image_format: "PNG"
+  min_text_size: 6
+  max_text_size: 72
+
+# Layout Analysis Configuration
+analyzer:
+  title_threshold: 20  # Font size threshold for titles
+  min_paragraph_chars: 10
+  group_tolerance: 10  # Pixels tolerance for grouping elements
+  detect_headers: true
+  detect_footers: true
+
+# Coordinate Mapping Configuration
+rebuilder:
+  slide_width: 10  # inches
+  slide_height: 7.5  # inches
+  margin_left: 0.5
+  margin_right: 0.5
+  margin_top: 0.5
+  margin_bottom: 0.5
+
+# Style Mapping Configuration
+mapper:
+  # Font mapping (PDF font -> PPT font)
+  font_mapping:
+    "SimHei": "Microsoft YaHei"
+    "SimSun": "宋体"
+    "Helvetica": "Arial"
+    "Times": "Times New Roman"
+    "Courier": "Courier New"
+  
+  default_font: "Arial"
+  default_font_size: 18
+  title_font_size: 32
+  
+  # Color schemes
+  preserve_colors: true
+  default_text_color: "#000000"
+
+# PPTX Generation Configuration
+generator:
+  template: null  # Path to PPTX template (optional)
+  slide_layout: "blank"  # blank, title, content, etc.
+  preserve_layout: true
+  compress_images: false
+  image_quality: 95
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "pdf2pptx.log"

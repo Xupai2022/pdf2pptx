@@ -1,0 +1,19 @@
+# PDF Processing
+PyMuPDF==1.23.8
+pdfplumber==0.10.3
+pdfminer.six==20221105
+
+# PPTX Generation
+python-pptx==0.6.23
+
+# Image Processing
+Pillow==10.1.0
+
+# Data Processing
+numpy==1.24.3
+
+# Configuration
+PyYAML==6.0.1
+
+# Logging
+colorlog==6.8.0
