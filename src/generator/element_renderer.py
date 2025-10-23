@@ -66,11 +66,11 @@ class ElementRenderer:
         width = Inches(position['width'])
         height = Inches(position['height'])
         
-        # Ensure minimum dimensions
-        if width < Inches(0.5):
-            width = Inches(1)
-        if height < Inches(0.3):
-            height = Inches(0.5)
+        # Ensure minimum dimensions (but keep them small for precise layout)
+        if width < Inches(0.3):
+            width = Inches(0.3)
+        if height < Inches(0.15):
+            height = Inches(0.2)
         
         try:
             textbox = slide.shapes.add_textbox(left, top, width, height)
@@ -112,11 +112,11 @@ class ElementRenderer:
         width = Inches(position['width'])
         height = Inches(position['height'])
         
-        # Ensure minimum dimensions
-        if width < Inches(0.5):
-            width = Inches(1)
-        if height < Inches(0.5):
-            height = Inches(1)
+        # Ensure reasonable dimensions (keep original size for small icons)
+        if width < Inches(0.05):
+            width = Inches(0.1)
+        if height < Inches(0.05):
+            height = Inches(0.1)
         
         try:
             picture = slide.shapes.add_picture(image_stream, left, top, width, height)
