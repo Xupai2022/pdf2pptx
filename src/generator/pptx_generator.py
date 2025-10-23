@@ -28,9 +28,11 @@ class PPTXGenerator:
             config: Configuration dictionary
         """
         self.config = config
-        self.template_path = config.get('template')
-        self.preserve_layout = config.get('preserve_layout', True)
-        self.compress_images = config.get('compress_images', False)
+        # Support both full config and generator-only config
+        generator_config = config.get('generator', config)
+        self.template_path = generator_config.get('template')
+        self.preserve_layout = generator_config.get('preserve_layout', True)
+        self.compress_images = generator_config.get('compress_images', False)
         
         # Initialize presentation
         if self.template_path and Path(self.template_path).exists():
@@ -38,9 +40,13 @@ class PPTXGenerator:
         else:
             self.prs = Presentation()
         
-        # Set slide dimensions
-        self.prs.slide_width = Inches(10)
-        self.prs.slide_height = Inches(7.5)
+        # Set slide dimensions from config (1920×1080 = 13.333" × 7.5" at 144 DPI)
+        rebuilder_config = config.get('rebuilder', {})
+        slide_width = rebuilder_config.get('slide_width', 13.333)
+        slide_height = rebuilder_config.get('slide_height', 7.5)
+        self.prs.slide_width = Inches(slide_width)
+        self.prs.slide_height = Inches(slide_height)
+        logger.info(f"Set slide dimensions to {slide_width}\" x {slide_height}\" (1920x1080px at 144 DPI)")
         
         # Initialize style mapper and element renderer
         self.style_mapper = StyleMapper(config)

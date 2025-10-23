@@ -66,9 +66,20 @@ class ElementRenderer:
         width = Inches(position['width'])
         height = Inches(position['height'])
         
-        # Ensure minimum dimensions (but keep them small for precise layout)
-        if width < Inches(0.3):
-            width = Inches(0.3)
+        # Calculate estimated text width to prevent wrapping
+        # Average character width is roughly 0.6 of font size
+        font_size = style.get('font_size', 18)
+        char_count = len(content.strip())
+        # Estimate required width in points (1 inch = 72 points)
+        estimated_width_pt = char_count * font_size * 0.6
+        estimated_width_inches = estimated_width_pt / 72.0
+        
+        # Use larger of provided width or estimated width (with 20% padding)
+        min_width = max(Inches(0.3), estimated_width_inches * 1.2)
+        if width < min_width:
+            width = min_width
+        
+        # Ensure minimum height
         if height < Inches(0.15):
             height = Inches(0.2)
         
@@ -81,7 +92,8 @@ class ElementRenderer:
             self.style_mapper.apply_text_style(text_frame, style)
             
             # Text frame properties
-            text_frame.word_wrap = True
+            # Disable word wrap to prevent forced line breaks
+            text_frame.word_wrap = False
             
             return textbox
             

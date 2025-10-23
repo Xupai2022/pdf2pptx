@@ -45,14 +45,14 @@ class SlideModel:
     Acts as a bridge between PDF layout and PPTX generation.
     """
     
-    def __init__(self, slide_number: int, width: float = 10, height: float = 7.5):
+    def __init__(self, slide_number: int, width: float = 13.333, height: float = 7.5):
         """
         Initialize a slide model.
         
         Args:
             slide_number: Slide number
-            width: Slide width in inches
-            height: Slide height in inches
+            width: Slide width in inches (default 13.333 for 1920px at 144 DPI)
+            height: Slide height in inches (default 7.5 for 1080px at 144 DPI)
         """
         self.slide_number = slide_number
         self.width = width

@@ -109,6 +109,7 @@ class CoordinateMapper:
                     shape_type = elem.get('shape_type', 'rectangle')
                     style = {
                         'fill_color': elem.get('fill_color'),
+                        'fill_opacity': elem.get('fill_opacity', 1.0),
                         'stroke_color': elem.get('stroke_color'),
                         'stroke_width': elem.get('stroke_width', 1)
                     }

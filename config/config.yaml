@@ -18,12 +18,12 @@ analyzer:
 
 # Coordinate Mapping Configuration
 rebuilder:
-  slide_width: 10  # inches
-  slide_height: 7.5  # inches
-  margin_left: 0.5
-  margin_right: 0.5
-  margin_top: 0.5
-  margin_bottom: 0.5
+  slide_width: 13.333  # inches (1920px at 144 DPI, 16:9 aspect ratio)
+  slide_height: 7.5  # inches (1080px at 144 DPI)
+  margin_left: 0.0  # No margins to match HTML exactly
+  margin_right: 0.0
+  margin_top: 0.0
+  margin_bottom: 0.0
 
 # Style Mapping Configuration
 mapper:
@@ -42,6 +42,18 @@ mapper:
   # Color schemes
   preserve_colors: true
   default_text_color: "#000000"
+  
+  # Semi-transparent color mapping (hex -> opacity)
+  # Maps solid colors extracted from PDF to their intended RGBA opacity
+  # Based on HTML reference: rgba(10, 66, 117, 0.08) and rgba(10, 66, 117, 0.03)
+  transparency_map:
+    "#0a4275": 0.08  # Main accent color light background (stat cards) - HTML
+    "#094174": 0.08  # Main accent color light background (stat cards) - PDF extracted
+    "#e6f0f5": 0.08  # Light blue-gray (alternative for stat cards)
+    "#f5f9fa": 0.03  # Very light blue-gray (data cards)
+    "#db2525": 0.1   # rgba(220,38,38,0.1) red risk badges - PDF extracted
+    "#f59d0a": 0.1   # rgba(245,158,11,0.1) orange risk badges - PDF extracted
+    "#3b82f6": 0.1   # rgba(59,130,246,0.1) blue risk badges
 
 # PPTX Generation Configuration
 generator:

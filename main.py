@@ -128,7 +128,8 @@ def convert_pdf_to_pptx(pdf_path: str, output_path: str, config: Dict[str, Any])
         logger.info("Step 4: Generating PowerPoint")
         logger.info("=" * 60)
         
-        generator = PPTXGenerator(config['generator'])
+        # Pass full config to generator so StyleMapper can access mapper section
+        generator = PPTXGenerator(config)
         
         if not generator.generate_from_models(slide_models):
             logger.error("Failed to generate presentation")
