@@ -53,18 +53,33 @@ class LayoutAnalyzerV2:
         for shape_elem in shape_elements:
             shape_area = shape_elem['width'] * shape_elem['height']
             page_area = page_width * page_height
+            width = shape_elem['width']
+            height = shape_elem['height']
             
+            # More precise role detection based on HTML specifications
             if shape_area > page_area * 0.5:
+                # Full-page background
                 role = 'background'
                 z_index = -1
-            elif shape_elem['height'] < 20:  # Thin horizontal shapes (like top bar)
+            elif height < 15 and width > page_width * 0.9:
+                # Thin horizontal bar across top (like top-bar: 10px height, full width)
                 role = 'decoration'
                 z_index = 0
-            elif shape_elem['width'] < 20:  # Thin vertical shapes (like borders)
+            elif width < 10 and height > 50:
+                # Narrow vertical strip (like border-left: 4px solid)
                 role = 'border'
                 z_index = 0
-            else:
+            elif width > 20 and height > 20 and width < 80 and height < 50:
+                # Small rectangles (like risk badges)
+                role = 'decoration'
+                z_index = 1
+            elif width > 200 and height > 50:
+                # Large rectangles (like card backgrounds)
                 role = 'card_background'
+                z_index = 0
+            else:
+                # Default to decoration for other shapes
+                role = 'decoration'
                 z_index = 0
             
             layout_regions.append({

@@ -103,7 +103,7 @@ class CoordinateMapper:
                         slide.add_image(image_data, img_position, image_format, z_index)
         
         elif role in ['shape', 'decoration', 'card_background', 'border']:
-            # Process shape
+            # Process shape with role information for proper transparency handling
             for elem in elements:
                 if elem.get('type') == 'shape':
                     shape_type = elem.get('shape_type', 'rectangle')
@@ -111,7 +111,8 @@ class CoordinateMapper:
                         'fill_color': elem.get('fill_color'),
                         'fill_opacity': elem.get('fill_opacity', 1.0),
                         'stroke_color': elem.get('stroke_color'),
-                        'stroke_width': elem.get('stroke_width', 1)
+                        'stroke_width': elem.get('stroke_width', 1),
+                        'role': role  # Pass role to style for transparency mapping
                     }
                     shape_position = self._pdf_to_slide_coords(
                         [elem['x'], elem['y'], elem['x2'], elem['y2']],

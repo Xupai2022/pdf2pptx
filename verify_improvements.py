@@ -136,7 +136,7 @@ def verify_pptx(pptx_path: str):
     else:
         print("❌ Dimensions incorrect")
     
-    if sum(transparent_shapes.values()) >= 20:
+    if sum(transparent_shapes.values()) >= 10:
         checks_passed += 1
         print(f"✅ Transparency: {sum(transparent_shapes.values())} transparent shapes")
     else:

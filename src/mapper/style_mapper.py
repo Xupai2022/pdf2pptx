@@ -33,6 +33,7 @@ class StyleMapper:
             self.preserve_colors = config.get('preserve_colors', True)
             self.default_font_size = config.get('default_font_size', 18)
             self.title_font_size = config.get('title_font_size', 32)
+            self.font_size_scale = config.get('font_size_scale', 1.0)
             self.transparency_map = config.get('transparency_map', {})
         else:
             # Nested config (when 'mapper' section is passed)
@@ -40,9 +41,12 @@ class StyleMapper:
             self.preserve_colors = mapper_config.get('preserve_colors', True)
             self.default_font_size = mapper_config.get('default_font_size', 18)
             self.title_font_size = mapper_config.get('title_font_size', 32)
+            self.font_size_scale = mapper_config.get('font_size_scale', 1.0)
             self.transparency_map = mapper_config.get('transparency_map', {})
         
-        logger.info(f"StyleMapper initialized with {len(self.transparency_map)} transparency mappings")
+        # Count transparency mappings
+        trans_count = sum(len(v) if isinstance(v, dict) else 1 for v in self.transparency_map.values())
+        logger.info(f"StyleMapper initialized with font scale {self.font_size_scale}, {trans_count} transparency mappings")
     
     def apply_text_style(self, text_frame, style: Dict[str, Any]):
         """
@@ -61,8 +65,9 @@ class StyleMapper:
         font_name = style.get('font_name', '')
         mapped_font = self.font_mapper.map_font(font_name)
         
-        # Font size
-        font_size = style.get('font_size', self.default_font_size)
+        # Font size with scaling (PDF points to screen pixels)
+        font_size_raw = style.get('font_size', self.default_font_size)
+        font_size = font_size_raw * self.font_size_scale
         
         # Color
         color = style.get('color', '#000000')
@@ -98,11 +103,20 @@ class StyleMapper:
             # Fill color (with optional transparency)
             fill_color = style.get('fill_color')
             fill_opacity = style.get('fill_opacity', 1.0)  # Default fully opaque
+            shape_role = style.get('role', 'unknown')  # Get shape role (border, card_background, etc.)
             
-            # Check if this color should have transparency based on mapping
-            if fill_color and fill_color.lower() in self.transparency_map:
-                fill_opacity = self.transparency_map[fill_color.lower()]
-                logger.debug(f"Applied transparency mapping: {fill_color} -> opacity {fill_opacity}")
+            # Check if this color should have transparency based on ROLE and color
+            # IMPORTANT: borders and top-bar should remain solid (no transparency)
+            if fill_color and shape_role in self.transparency_map:
+                role_map = self.transparency_map[shape_role]
+                if isinstance(role_map, dict) and fill_color.lower() in role_map:
+                    fill_opacity = role_map[fill_color.lower()]
+                    logger.debug(f"Applied transparency: {shape_role} {fill_color} -> opacity {fill_opacity}")
+            elif fill_color and not isinstance(self.transparency_map.get(shape_role), dict):
+                # Fallback to old flat mapping for compatibility
+                if fill_color.lower() in self.transparency_map:
+                    fill_opacity = self.transparency_map[fill_color.lower()]
+                    logger.debug(f"Applied transparency (flat): {fill_color} -> opacity {fill_opacity}")
             
             if fill_color and fill_color != 'None' and self.preserve_colors:
                 rgb = self.hex_to_rgb(fill_color)
