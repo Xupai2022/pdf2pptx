@@ -42,6 +42,14 @@ class ElementRenderer:
         content = element.content
         style = element.style
         
+        # Clean content - remove control characters for XML compatibility
+        if isinstance(content, str):
+            # Remove NULL bytes and control characters except tab, newline, carriage return
+            content = ''.join(c for c in content if ord(c) >= 32 or c in '\t\n\r')
+        
+        if not content:
+            return None
+        
         # Create text box
         left = Inches(position['x'])
         top = Inches(position['y'])
@@ -122,6 +130,10 @@ class ElementRenderer:
         position = element.position
         shape_type = element.content
         style = element.style
+        
+        # Validate shape_type
+        if not shape_type or not isinstance(shape_type, str):
+            shape_type = 'rectangle'
         
         # Position and size
         left = Inches(position['x'])

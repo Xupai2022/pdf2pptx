@@ -76,26 +76,29 @@ class StyleMapper:
             shape: PowerPoint shape object
             style: Style dictionary
         """
-        # Fill color
-        fill_color = style.get('fill_color')
-        if fill_color and self.preserve_colors:
-            rgb = self.hex_to_rgb(fill_color)
-            shape.fill.solid()
-            shape.fill.fore_color.rgb = RGBColor(*rgb)
-        else:
-            shape.fill.background()
+        if not style:
+            return
         
-        # Stroke/line color
-        stroke_color = style.get('stroke_color')
-        stroke_width = style.get('stroke_width', 1)
-        
-        if stroke_color and self.preserve_colors:
-            rgb = self.hex_to_rgb(stroke_color)
-            shape.line.color.rgb = RGBColor(*rgb)
-            shape.line.width = Pt(stroke_width)
-        else:
-            # No line
-            shape.line.fill.background()
+        try:
+            # Fill color
+            fill_color = style.get('fill_color')
+            if fill_color and fill_color != 'None' and self.preserve_colors:
+                rgb = self.hex_to_rgb(fill_color)
+                if rgb != (0, 0, 0) or fill_color.lower() in ['#000000', '#000']:
+                    shape.fill.solid()
+                    shape.fill.fore_color.rgb = RGBColor(*rgb)
+            
+            # Stroke/line color
+            stroke_color = style.get('stroke_color')
+            stroke_width = style.get('stroke_width', 1)
+            
+            if stroke_color and stroke_color != 'None' and self.preserve_colors:
+                rgb = self.hex_to_rgb(stroke_color)
+                shape.line.color.rgb = RGBColor(*rgb)
+                if stroke_width and isinstance(stroke_width, (int, float)):
+                    shape.line.width = Pt(stroke_width)
+        except Exception as e:
+            logger.warning(f"Failed to apply shape style: {e}")
     
     def hex_to_rgb(self, hex_color: str) -> tuple:
         """
