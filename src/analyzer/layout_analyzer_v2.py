@@ -194,6 +194,13 @@ class LayoutAnalyzerV2:
                 y_diff = abs(other_y - elem_y)
                 x_gap = other_x - current_x2
                 
+                # Check if elements have the same text style (bold, italic)
+                elem_is_bold = elem.get('is_bold', False)
+                elem_is_italic = elem.get('is_italic', False)
+                other_is_bold = other.get('is_bold', False)
+                other_is_italic = other.get('is_italic', False)
+                same_style = (elem_is_bold == other_is_bold) and (elem_is_italic == other_is_italic)
+                
                 # Group if on same line and close horizontal proximity
                 # Use very small gap tolerance (1pt) for tightly-coupled text like "8个", "高危4"
                 # Use larger tolerance (30pt) for related text with spacing
@@ -205,7 +212,8 @@ class LayoutAnalyzerV2:
                     
                     # Direction 1: Check if other element is directly to our RIGHT
                     if 0 <= x_gap <= 1.0:
-                        if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color:
+                        # Only group if same font size, color AND style (bold/italic)
+                        if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color and same_style:
                             should_group = True
                             if elem.get('content', '') in ['8', '高危', '4', '12', '19']:
                                 logger.debug(f"  → Grouping '{other.get('content', '')}' on RIGHT (gap={x_gap:.2f}pt)")
@@ -215,9 +223,9 @@ class LayoutAnalyzerV2:
                     elif x_gap < 0:
                         other_x2 = other.get('x2', other_x)
                         left_gap = elem_x - other_x2
-                        # Only group if they are adjacent (gap ≤ 1pt)
+                        # Only group if they are adjacent (gap ≤ 1pt) and same style
                         if -1.0 <= left_gap <= 1.0:
-                            if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color:
+                            if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color and same_style:
                                 should_group = True
                                 if elem.get('content', '') in ['8', '高危', '4', '12', '19']:
                                     logger.debug(f"  → Grouping '{other.get('content', '')}' on LEFT (left_gap={left_gap:.2f}pt)")
@@ -225,7 +233,7 @@ class LayoutAnalyzerV2:
                         logger.debug(f"  × Checking '{other.get('content', '')}' after '{ elem.get('content', '')}' (gap={x_gap:.2f}pt, y_diff={y_diff:.2f}pt)")
                     # Moderate distance (1pt < gap ≤ 30pt) - group only if same style
                     elif 1.0 < x_gap <= self.group_tolerance * 3:
-                        if other_font_size == elem_font_size and other_color == elem_color:
+                        if other_font_size == elem_font_size and other_color == elem_color and same_style:
                             should_group = True
                             if elem.get('content', '') in ['8', '高危']:
                                 logger.debug(f"  → Grouping '{other.get('content', '')}' (gap={x_gap:.2f}pt, moderate)")
