@@ -131,8 +131,17 @@ class LayoutAnalyzerV2:
         if not text_elements:
             return []
         
-        # Sort by Y position first
-        sorted_elements = sorted(text_elements, key=lambda e: (e.get('y', 0), e.get('x', 0)))
+        # Sort by Y position first, but treat elements within group_tolerance as same line
+        # For same-line elements, sort by X position to maintain reading order
+        def sort_key(e):
+            y = e.get('y', 0)
+            x = e.get('x', 0)
+            # Quantize Y to group_tolerance to treat nearby elements as same line
+            # This ensures "已知CVE利用" stays in correct order even with slight Y variations
+            y_quantized = int(y / self.group_tolerance) * self.group_tolerance
+            return (y_quantized, x)
+        
+        sorted_elements = sorted(text_elements, key=sort_key)
         
         regions = []
         processed = set()
