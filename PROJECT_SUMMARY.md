@@ -101,7 +101,7 @@ pdf2pptx/
 │   │   ├── pdf_parser.py           # Main parser (PyMuPDF)
 │   │   └── element_extractor.py    # Element filtering/grouping
 │   ├── analyzer/                    # Layout analysis layer
-│   │   ├── layout_analyzer.py      # Structure detection
+│   │   ├── layout_analyzer_v2.py   # Structure detection (improved)
 │   │   └── structure_detector.py   # Tables, lists, charts
 │   ├── rebuilder/                   # Element rebuilding layer
 │   │   ├── slide_model.py          # Intermediate representation

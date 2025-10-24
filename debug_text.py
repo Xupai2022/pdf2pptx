@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from main import load_config
 from src.parser.pdf_parser import PDFParser
-from src.analyzer.layout_analyzer import LayoutAnalyzer
+from src.analyzer.layout_analyzer_v2 import LayoutAnalyzerV2
 
 config = load_config()
 parser_config = config.get('parser', {})
@@ -55,7 +55,7 @@ print("\n" + "=" * 60)
 print("LAYOUT ANALYSIS")
 print("=" * 60)
 
-analyzer = LayoutAnalyzer(analyzer_config)
+analyzer = LayoutAnalyzerV2(analyzer_config)
 layout = analyzer.analyze_page(page_data)
 print(f"\nTotal regions: {len(layout['layout'])}")
 print(f"\nFirst 5 text regions:")

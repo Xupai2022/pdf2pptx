@@ -196,7 +196,7 @@ if success:
 
 ```python
 from src.parser.pdf_parser import PDFParser
-from src.analyzer.layout_analyzer import LayoutAnalyzer
+from src.analyzer.layout_analyzer_v2 import LayoutAnalyzerV2
 from src.rebuilder.coordinate_mapper import CoordinateMapper
 from src.generator.pptx_generator import PPTXGenerator
 
@@ -210,7 +210,7 @@ pages = parser.extract_all_pages()
 parser.close()
 
 # Step 2: Analyze layout
-analyzer = LayoutAnalyzer(config['analyzer'])
+analyzer = LayoutAnalyzerV2(config['analyzer'])
 analyzed_pages = [analyzer.analyze_page(page) for page in pages]
 
 # Step 3: Build slide models
