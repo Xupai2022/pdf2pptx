@@ -4,6 +4,7 @@ PDF Parser - Main parser class for extracting content from PDF files
 
 import fitz  # PyMuPDF
 import logging
+import re
 from typing import List, Dict, Any, Tuple
 from pathlib import Path
 import io
@@ -103,6 +104,9 @@ class PDFParser:
             'elements': []
         }
         
+        # Extract ExtGState opacity mapping for this page
+        opacity_map = self._extract_opacity_map(page)
+        
         # Extract text blocks
         text_elements = self._extract_text_blocks(page)
         page_data['elements'].extend(text_elements)
@@ -112,8 +116,8 @@ class PDFParser:
             image_elements = self._extract_images(page, page_num)
             page_data['elements'].extend(image_elements)
         
-        # Extract shapes/drawings
-        drawing_elements = self._extract_drawings(page)
+        # Extract shapes/drawings with opacity information
+        drawing_elements = self._extract_drawings(page, opacity_map)
         page_data['elements'].extend(drawing_elements)
         
         logger.info(f"Page {page_num}: Extracted {len(page_data['elements'])} elements")
@@ -228,26 +232,83 @@ class PDFParser:
         
         return image_elements
     
-    def _extract_drawings(self, page: fitz.Page) -> List[Dict[str, Any]]:
+    def _extract_opacity_map(self, page: fitz.Page) -> Dict[str, float]:
         """
-        Extract vector drawings and shapes from the page.
+        Extract ExtGState opacity mapping from page resources.
         
         Args:
             page: PyMuPDF page object
+            
+        Returns:
+            Dictionary mapping graphics state names to opacity values
+        """
+        opacity_map = {}
+        
+        try:
+            # Get page object definition
+            page_dict = self.doc.xref_object(page.xref, compressed=False)
+            
+            # Find ExtGState resources
+            extgstate_pattern = r'/ExtGState\s*<<([^>]+)>>'
+            match = re.search(extgstate_pattern, page_dict)
+            
+            if match:
+                extgstate_content = match.group(1)
+                # Extract GS references: /GS1 12 0 R
+                gs_refs = re.findall(r'/GS(\d+)\s+(\d+)\s+\d+\s+R', extgstate_content)
+                
+                for gs_num, xref in gs_refs:
+                    gs_name = f"GS{gs_num}"
+                    try:
+                        # Get the graphics state object
+                        gs_obj = self.doc.xref_object(int(xref), compressed=False)
+                        
+                        # Extract fill opacity (ca) and stroke opacity (CA)
+                        ca_match = re.search(r'/ca\s+([\d.]+)', gs_obj)
+                        if ca_match:
+                            opacity = float(ca_match.group(1))
+                            opacity_map[gs_name] = opacity
+                            logger.debug(f"Extracted opacity: {gs_name} = {opacity}")
+                    except Exception as e:
+                        logger.debug(f"Could not read GS object {gs_name}: {e}")
+            
+        except Exception as e:
+            logger.debug(f"Could not extract opacity map: {e}")
+        
+        return opacity_map
+    
+    def _extract_drawings(self, page: fitz.Page, opacity_map: Dict[str, float] = None) -> List[Dict[str, Any]]:
+        """
+        Extract vector drawings and shapes from the page with opacity information.
+        
+        Args:
+            page: PyMuPDF page object
+            opacity_map: Mapping of graphics state names to opacity values
             
         Returns:
             List of drawing element dictionaries
         """
         drawing_elements = []
         
+        if opacity_map is None:
+            opacity_map = {}
+        
         try:
             # Get drawing paths
             drawings = page.get_drawings()
             
-            for drawing in drawings:
+            # Parse content stream to match drawings with graphics states
+            gs_opacity_sequence = self._parse_content_stream_opacity(page, opacity_map)
+            
+            for idx, drawing in enumerate(drawings):
                 rect = drawing.get("rect")
                 if not rect:
                     continue
+                
+                # Try to match this drawing with its opacity from content stream
+                fill_opacity = 1.0
+                if idx < len(gs_opacity_sequence):
+                    fill_opacity = gs_opacity_sequence[idx]
                 
                 element = {
                     'type': 'shape',
@@ -259,6 +320,7 @@ class PDFParser:
                     'width': rect.width,
                     'height': rect.height,
                     'fill_color': self._rgb_to_hex(drawing.get("fill", None)),
+                    'fill_opacity': fill_opacity,
                     'stroke_color': self._rgb_to_hex(drawing.get("color", None)),
                     'stroke_width': drawing.get("width", 1)
                 }
@@ -269,6 +331,58 @@ class PDFParser:
             logger.warning(f"Failed to extract drawings: {e}")
         
         return drawing_elements
+    
+    def _parse_content_stream_opacity(self, page: fitz.Page, opacity_map: Dict[str, float]) -> List[float]:
+        """
+        Parse content stream to extract opacity for each drawing operation.
+        
+        Args:
+            page: PyMuPDF page object
+            opacity_map: Mapping of graphics state names to opacity values
+            
+        Returns:
+            List of opacity values in drawing order
+        """
+        opacity_sequence = []
+        current_opacity = 1.0
+        
+        try:
+            # Get content stream
+            xref = page.get_contents()[0]
+            content_stream = self.doc.xref_stream(xref).decode('latin-1')
+            
+            # Split by whitespace to get tokens
+            # PDF content stream is a sequence of operators and operands
+            tokens = content_stream.split()
+            
+            i = 0
+            while i < len(tokens):
+                token = tokens[i]
+                
+                # Check for graphics state change: /GSx gs
+                if token.startswith('/GS') and i + 1 < len(tokens) and tokens[i + 1] == 'gs':
+                    gs_match = re.match(r'/GS(\d+)', token)
+                    if gs_match:
+                        gs_name = f"GS{gs_match.group(1)}"
+                        current_opacity = opacity_map.get(gs_name, 1.0)
+                        logger.debug(f"Graphics state changed to {gs_name}, opacity = {current_opacity}")
+                    i += 2
+                    continue
+                
+                # Check for fill operations: 'f' or 'f*'
+                # These indicate a shape has been filled
+                if token in ['f', 'f*']:
+                    opacity_sequence.append(current_opacity)
+                    logger.debug(f"Fill operation #{len(opacity_sequence)}, opacity = {current_opacity}")
+                
+                i += 1
+            
+            logger.debug(f"Extracted {len(opacity_sequence)} opacity values from content stream")
+            
+        except Exception as e:
+            logger.debug(f"Could not parse content stream for opacity: {e}")
+        
+        return opacity_sequence
     
     def _rgb_to_hex(self, color) -> str:
         """

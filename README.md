@@ -82,7 +82,7 @@ pdf2pptx/
 │   │   └── element_extractor.py
 │   ├── analyzer/          # Layout analysis module
 │   │   ├── __init__.py
-│   │   ├── layout_analyzer.py
+│   │   ├── layout_analyzer_v2.py
 │   │   └── structure_detector.py
 │   ├── rebuilder/         # Element rebuilding module
 │   │   ├── __init__.py

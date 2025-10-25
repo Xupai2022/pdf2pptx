@@ -55,4 +55,5 @@ tests/*.pptx
 
 pdf2ppt/
 .cache/
+.claude/
 

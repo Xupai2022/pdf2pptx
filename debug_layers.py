@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from main import load_config, setup_logging
 from src.parser.pdf_parser import PDFParser
-from src.analyzer.layout_analyzer import LayoutAnalyzer
+# Removed v1 import, now using v2 only
 from src.analyzer.layout_analyzer_v2 import LayoutAnalyzerV2
 from src.rebuilder.coordinate_mapper import CoordinateMapper
 
