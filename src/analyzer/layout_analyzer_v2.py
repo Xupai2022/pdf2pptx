@@ -131,15 +131,12 @@ class LayoutAnalyzerV2:
         if not text_elements:
             return []
         
-        # Sort by Y position first, but treat elements within group_tolerance as same line
-        # For same-line elements, sort by X position to maintain reading order
+        # Sort by Y position first, then X position for reading order
+        # Use original coordinates to maintain natural document flow
         def sort_key(e):
             y = e.get('y', 0)
             x = e.get('x', 0)
-            # Quantize Y to group_tolerance to treat nearby elements as same line
-            # This ensures "已知CVE利用" stays in correct order even with slight Y variations
-            y_quantized = int(y / self.group_tolerance) * self.group_tolerance
-            return (y_quantized, x)
+            return (y, x)
         
         sorted_elements = sorted(text_elements, key=sort_key)
         
@@ -216,11 +213,12 @@ class LayoutAnalyzerV2:
                 if y_diff <= self.group_tolerance:
                     should_group = False
                     
-                    # Very close elements (gap ≤ 1pt, allow negative for overlaps or left neighbors)
+                    # Very close elements (gap ≤ 1pt, allow negative for overlaps)
                     # Check both directions: element could be to the left or right
                     
                     # Direction 1: Check if other element is directly to our RIGHT
-                    if 0 <= x_gap <= 1.0:
+                    # Allow small negative gaps (down to -1pt) for slight overlaps
+                    if -1.0 <= x_gap <= 1.0:
                         # Only group if same font size, color AND style (bold/italic)
                         if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color and same_style:
                             should_group = True
