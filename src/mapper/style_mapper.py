@@ -102,21 +102,27 @@ class StyleMapper:
         try:
             # Fill color (with optional transparency)
             fill_color = style.get('fill_color')
-            fill_opacity = style.get('fill_opacity', 1.0)  # Default fully opaque
+            # Use opacity from PDF extraction if available, otherwise use default or config
+            fill_opacity = style.get('fill_opacity', 1.0)
             shape_role = style.get('role', 'unknown')  # Get shape role (border, card_background, etc.)
             
-            # Check if this color should have transparency based on ROLE and color
-            # IMPORTANT: borders and top-bar should remain solid (no transparency)
-            if fill_color and shape_role in self.transparency_map:
-                role_map = self.transparency_map[shape_role]
-                if isinstance(role_map, dict) and fill_color.lower() in role_map:
-                    fill_opacity = role_map[fill_color.lower()]
-                    logger.debug(f"Applied transparency: {shape_role} {fill_color} -> opacity {fill_opacity}")
-            elif fill_color and not isinstance(self.transparency_map.get(shape_role), dict):
-                # Fallback to old flat mapping for compatibility
-                if fill_color.lower() in self.transparency_map:
-                    fill_opacity = self.transparency_map[fill_color.lower()]
-                    logger.debug(f"Applied transparency (flat): {fill_color} -> opacity {fill_opacity}")
+            # If opacity was not extracted from PDF, check config-based transparency mapping
+            # This provides backward compatibility with manual transparency configuration
+            if fill_opacity == 1.0 and fill_color:
+                # Check role-based transparency mapping (new approach)
+                if shape_role in self.transparency_map:
+                    role_map = self.transparency_map[shape_role]
+                    if isinstance(role_map, dict) and fill_color.lower() in role_map:
+                        fill_opacity = role_map[fill_color.lower()]
+                        logger.debug(f"Applied config transparency: {shape_role} {fill_color} -> opacity {fill_opacity}")
+                elif not isinstance(self.transparency_map.get(shape_role), dict):
+                    # Fallback to old flat mapping for compatibility
+                    if fill_color.lower() in self.transparency_map:
+                        fill_opacity = self.transparency_map[fill_color.lower()]
+                        logger.debug(f"Applied config transparency (flat): {fill_color} -> opacity {fill_opacity}")
+            elif fill_opacity < 1.0:
+                # Opacity was extracted from PDF
+                logger.debug(f"Using PDF-extracted opacity: {fill_opacity:.3f} for color {fill_color}")
             
             if fill_color and fill_color != 'None' and self.preserve_colors:
                 rgb = self.hex_to_rgb(fill_color)
