@@ -250,15 +250,16 @@ class PDFParser:
             
             # Find ExtGState resources
             extgstate_pattern = r'/ExtGState\s*<<([^>]+)>>'
-            match = re.search(extgstate_pattern, page_dict)
+            match = re.search(extgstate_pattern, page_dict, re.DOTALL)
             
             if match:
                 extgstate_content = match.group(1)
-                # Extract GS references: /GS1 12 0 R
-                gs_refs = re.findall(r'/GS(\d+)\s+(\d+)\s+\d+\s+R', extgstate_content)
+                # Extract graphics state references with flexible naming
+                # Matches: /GS1, /G3, /a1, /Alpha2, etc.
+                # Pattern: /[Name][OptionalNumber] [xref] 0 R
+                gs_refs = re.findall(r'/([A-Za-z]+\d*)\s+(\d+)\s+\d+\s+R', extgstate_content)
                 
-                for gs_num, xref in gs_refs:
-                    gs_name = f"GS{gs_num}"
+                for gs_name, xref in gs_refs:
                     try:
                         # Get the graphics state object
                         gs_obj = self.doc.xref_object(int(xref), compressed=False)
@@ -268,9 +269,9 @@ class PDFParser:
                         if ca_match:
                             opacity = float(ca_match.group(1))
                             opacity_map[gs_name] = opacity
-                            logger.debug(f"Extracted opacity: {gs_name} = {opacity}")
+                            logger.debug(f"Extracted opacity: /{gs_name} = {opacity}")
                     except Exception as e:
-                        logger.debug(f"Could not read GS object {gs_name}: {e}")
+                        logger.debug(f"Could not read GS object /{gs_name}: {e}")
             
         except Exception as e:
             logger.debug(f"Could not extract opacity map: {e}")
@@ -359,13 +360,14 @@ class PDFParser:
             while i < len(tokens):
                 token = tokens[i]
                 
-                # Check for graphics state change: /GSx gs
-                if token.startswith('/GS') and i + 1 < len(tokens) and tokens[i + 1] == 'gs':
-                    gs_match = re.match(r'/GS(\d+)', token)
+                # Check for graphics state change: /[Name] gs (flexible pattern)
+                # Matches: /GS1 gs, /G3 gs, /a1 gs, /Alpha gs, etc.
+                if token.startswith('/') and i + 1 < len(tokens) and tokens[i + 1] == 'gs':
+                    gs_match = re.match(r'/([A-Za-z]+\d*)', token)
                     if gs_match:
-                        gs_name = f"GS{gs_match.group(1)}"
+                        gs_name = gs_match.group(1)
                         current_opacity = opacity_map.get(gs_name, 1.0)
-                        logger.debug(f"Graphics state changed to {gs_name}, opacity = {current_opacity}")
+                        logger.debug(f"Graphics state changed to /{gs_name}, opacity = {current_opacity}")
                     i += 2
                     continue
                 
