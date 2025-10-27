@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Tuple
 from pathlib import Path
 import io
 from PIL import Image
-from .border_extractor import BorderExtractor
+from .border_detector import BorderDetector
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,8 @@ class PDFParser:
         self.max_text_size = config.get('max_text_size', 72)
         self.doc = None
         
-        # Initialize border extractor
-        self.border_extractor = BorderExtractor(config)
+        # Initialize border detector
+        self.border_detector = BorderDetector(config)
         
     def open(self, pdf_path: str) -> bool:
         """
@@ -305,6 +305,7 @@ class PDFParser:
             # Parse content stream to build a position-based opacity map
             opacity_by_position = self._parse_content_stream_opacity_enhanced(page, opacity_map)
             
+            # Convert drawings to shape elements
             for idx, drawing in enumerate(drawings):
                 rect = drawing.get("rect")
                 if not rect:
@@ -333,20 +334,17 @@ class PDFParser:
                 
                 drawing_elements.append(element)
             
-            # Extract borders from complex paths (e.g., rounded rectangles with border-left)
-            page_width = page.rect.width
-            border_elements = self.border_extractor.extract_borders_from_drawings(drawings, page_width)
+            # CRITICAL: Detect borders BEFORE deduplication
+            # Borders are created by pairs of overlapping shapes with small offsets
+            # We must detect them before deduplication removes the duplicate shapes
+            border_elements = self.border_detector.detect_borders_from_shapes(drawing_elements)
             
-            # Filter out duplicate borders that are already in drawing_elements
-            border_elements = self.border_extractor.filter_duplicate_borders(border_elements, drawing_elements)
-            
-            # Add extracted borders to drawing elements
-            if border_elements:
-                logger.info(f"Extracted {len(border_elements)} border element(s) from complex paths")
-                drawing_elements.extend(border_elements)
-            
-            # Deduplicate overlapping shapes (border artifacts from HTML-to-PDF conversion)
+            # Now deduplicate overlapping shapes (removes border artifacts)
             drawing_elements = self._deduplicate_overlapping_shapes(drawing_elements)
+            
+            # Add detected borders after deduplication
+            if border_elements:
+                drawing_elements.extend(border_elements)
                 
         except Exception as e:
             logger.warning(f"Failed to extract drawings: {e}")
