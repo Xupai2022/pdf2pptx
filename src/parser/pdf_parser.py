@@ -575,6 +575,7 @@ class PDFParser:
         4. They have different opacity values (one transparent, one opaque)
         5. CRITICAL: The transparent and opaque versions must have VERY different opacity
            (e.g., 0.03 vs 1.0, NOT 0.03 vs 0.08)
+        6. NEW: Small positional offsets (<3pt) that create decorative border effects should NOT be merged
         
         Args:
             shape1: First shape element
@@ -607,15 +608,48 @@ class PDFParser:
         if not (has_transparent and has_fully_opaque):
             return False
         
-        # Check position overlap (tolerance: 2pt for slight positioning differences)
+        # Calculate position and size differences
+        x_diff = abs(shape1['x'] - shape2['x'])
+        y_diff = abs(shape1['y'] - shape2['y'])
+        width_diff = abs(shape1['width'] - shape2['width'])
+        height_diff = abs(shape1['height'] - shape2['height'])
+        
+        # CRITICAL FIX: Detect decorative border patterns
+        # When two shapes have a small offset (0.5-3pt) with matching size difference,
+        # this creates an intentional decorative border effect that should NOT be merged.
+        # Example: shape1 at x=60 with width=1320, shape2 at x=61.5 with width=1318.5
+        # creates a 1.5pt left border effect.
+        decorative_offset_threshold = 3.0  # 3pt threshold for decorative borders
+        
+        # Check if this is a decorative border pattern:
+        # - Small X offset (< 3pt) with matching width difference
+        # - OR small Y offset (< 3pt) with matching height difference
+        is_decorative_x_border = (
+            0.5 < x_diff < decorative_offset_threshold and
+            abs(x_diff - width_diff) < 0.1  # offset matches size difference
+        )
+        is_decorative_y_border = (
+            0.5 < y_diff < decorative_offset_threshold and
+            abs(y_diff - height_diff) < 0.1
+        )
+        
+        if is_decorative_x_border or is_decorative_y_border:
+            logger.debug(
+                f"Detected decorative border pattern - NOT merging: "
+                f"x_diff={x_diff:.2f}, y_diff={y_diff:.2f}, "
+                f"width_diff={width_diff:.2f}, height_diff={height_diff:.2f}"
+            )
+            return False
+        
+        # Standard overlap detection with 2pt tolerance
         position_tolerance = 2.0
-        x_overlap = abs(shape1['x'] - shape2['x']) <= position_tolerance
-        y_overlap = abs(shape1['y'] - shape2['y']) <= position_tolerance
+        x_overlap = x_diff <= position_tolerance
+        y_overlap = y_diff <= position_tolerance
         
         # Check size similarity (tolerance: 2pt for border width differences)
         size_tolerance = 2.0
-        width_similar = abs(shape1['width'] - shape2['width']) <= size_tolerance
-        height_similar = abs(shape1['height'] - shape2['height']) <= size_tolerance
+        width_similar = width_diff <= size_tolerance
+        height_similar = height_diff <= size_tolerance
         
         return x_overlap and y_overlap and width_similar and height_similar
     
