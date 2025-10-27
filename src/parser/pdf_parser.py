@@ -327,6 +327,9 @@ class PDFParser:
                 }
                 
                 drawing_elements.append(element)
+            
+            # Deduplicate overlapping shapes (border artifacts from HTML-to-PDF conversion)
+            drawing_elements = self._deduplicate_overlapping_shapes(drawing_elements)
                 
         except Exception as e:
             logger.warning(f"Failed to extract drawings: {e}")
@@ -385,6 +388,145 @@ class PDFParser:
             logger.debug(f"Could not parse content stream for opacity: {e}")
         
         return opacity_sequence
+    
+    def _deduplicate_overlapping_shapes(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Remove duplicate overlapping shapes that are artifacts from HTML-to-PDF conversion.
+        
+        When HTML/CSS containers with borders are converted to PDF, they often create
+        two nearly identical rectangles:
+        - One with transparency (the background)
+        - One fully opaque (serving as a visual border)
+        
+        This method detects and merges such duplicates, keeping only the shape with
+        the most specific styling (typically the one with transparency).
+        
+        Args:
+            shapes: List of shape elements
+            
+        Returns:
+            Deduplicated list of shape elements
+        """
+        if len(shapes) <= 1:
+            return shapes
+        
+        deduplicated = []
+        skip_indices = set()
+        
+        for i, shape1 in enumerate(shapes):
+            if i in skip_indices:
+                continue
+            
+            # Look for similar shapes
+            found_duplicate = False
+            
+            for j in range(i + 1, len(shapes)):
+                if j in skip_indices:
+                    continue
+                
+                shape2 = shapes[j]
+                
+                # Check if shapes are nearly identical (overlap detection)
+                if self._are_shapes_overlapping(shape1, shape2):
+                    # Merge the shapes, preferring the one with transparency
+                    merged = self._merge_overlapping_shapes(shape1, shape2)
+                    deduplicated.append(merged)
+                    skip_indices.add(i)
+                    skip_indices.add(j)
+                    found_duplicate = True
+                    
+                    logger.debug(f"Merged overlapping shapes: "
+                               f"Shape1 at ({shape1['x']:.1f}, {shape1['y']:.1f}), "
+                               f"Shape2 at ({shape2['x']:.1f}, {shape2['y']:.1f}), "
+                               f"opacity1={shape1['fill_opacity']:.3f}, "
+                               f"opacity2={shape2['fill_opacity']:.3f}")
+                    break
+            
+            if not found_duplicate:
+                deduplicated.append(shape1)
+        
+        return deduplicated
+    
+    def _are_shapes_overlapping(self, shape1: Dict[str, Any], shape2: Dict[str, Any]) -> bool:
+        """
+        Check if two shapes are overlapping duplicates (border artifacts).
+        
+        Shapes are considered duplicates if:
+        1. They have the same color
+        2. Their positions overlap significantly (within 2pt tolerance)
+        3. Their sizes are nearly identical (within 2pt tolerance)
+        4. They have different opacity values (one transparent, one opaque)
+        
+        Args:
+            shape1: First shape element
+            shape2: Second shape element
+            
+        Returns:
+            True if shapes are overlapping duplicates
+        """
+        # Must have same fill color
+        if shape1['fill_color'] != shape2['fill_color']:
+            return False
+        
+        # Must have different opacity values (one transparent, one opaque)
+        opacity1 = shape1['fill_opacity']
+        opacity2 = shape2['fill_opacity']
+        
+        # Skip if both have same opacity
+        if abs(opacity1 - opacity2) < 0.001:
+            return False
+        
+        # One must be transparent (< 0.5) and one must be opaque (> 0.5)
+        has_transparent = min(opacity1, opacity2) < 0.5
+        has_opaque = max(opacity1, opacity2) > 0.5
+        
+        if not (has_transparent and has_opaque):
+            return False
+        
+        # Check position overlap (tolerance: 2pt for slight positioning differences)
+        position_tolerance = 2.0
+        x_overlap = abs(shape1['x'] - shape2['x']) <= position_tolerance
+        y_overlap = abs(shape1['y'] - shape2['y']) <= position_tolerance
+        
+        # Check size similarity (tolerance: 2pt for border width differences)
+        size_tolerance = 2.0
+        width_similar = abs(shape1['width'] - shape2['width']) <= size_tolerance
+        height_similar = abs(shape1['height'] - shape2['height']) <= size_tolerance
+        
+        return x_overlap and y_overlap and width_similar and height_similar
+    
+    def _merge_overlapping_shapes(self, shape1: Dict[str, Any], shape2: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge two overlapping shapes, keeping the best attributes.
+        
+        Strategy:
+        - Use the position and size from the transparent shape (more accurate)
+        - Use the transparency value from the transparent shape
+        - Remove any border (stroke) since it's an artifact
+        
+        Args:
+            shape1: First shape element
+            shape2: Second shape element
+            
+        Returns:
+            Merged shape element
+        """
+        # Identify which shape has transparency
+        if shape1['fill_opacity'] < shape2['fill_opacity']:
+            transparent_shape = shape1
+            opaque_shape = shape2
+        else:
+            transparent_shape = shape2
+            opaque_shape = shape1
+        
+        # Create merged shape based on transparent one
+        merged = transparent_shape.copy()
+        
+        # Remove any stroke/border (it's an artifact from the opaque shape)
+        merged['stroke_color'] = None
+        merged['stroke_width'] = 0
+        
+        return merged
     
     def _rgb_to_hex(self, color) -> str:
         """
