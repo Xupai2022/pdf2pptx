@@ -298,18 +298,19 @@ class PDFParser:
             # Get drawing paths
             drawings = page.get_drawings()
             
-            # Parse content stream to match drawings with graphics states
-            gs_opacity_sequence = self._parse_content_stream_opacity(page, opacity_map)
+            # Parse content stream to build a position-based opacity map
+            opacity_by_position = self._parse_content_stream_opacity_enhanced(page, opacity_map)
             
             for idx, drawing in enumerate(drawings):
                 rect = drawing.get("rect")
                 if not rect:
                     continue
                 
-                # Try to match this drawing with its opacity from content stream
-                fill_opacity = 1.0
-                if idx < len(gs_opacity_sequence):
-                    fill_opacity = gs_opacity_sequence[idx]
+                # PyMuPDF provides fill_opacity directly in the drawing dict!
+                # Use it if available, otherwise try to match from content stream
+                fill_opacity = drawing.get("fill_opacity", None)
+                if fill_opacity is None:
+                    fill_opacity = self._find_opacity_for_drawing(rect, opacity_by_position)
                 
                 element = {
                     'type': 'shape',
@@ -389,6 +390,122 @@ class PDFParser:
         
         return opacity_sequence
     
+    def _parse_content_stream_opacity_enhanced(self, page: fitz.Page, opacity_map: Dict[str, float]) -> Dict[tuple, float]:
+        """
+        Parse content stream to create a sequence of opacity values for filled rectangles.
+        
+        This method extracts the opacity sequence for all fill operations in order,
+        which will be matched with get_drawings() output by analyzing overlapping patterns.
+        
+        Args:
+            page: PyMuPDF page object
+            opacity_map: Mapping of graphics state names to opacity values
+            
+        Returns:
+            Dictionary mapping drawing characteristics to opacity values
+        """
+        opacity_info = {'sequence': [], 'by_size': {}}
+        current_opacity = 1.0
+        
+        try:
+            # Get content stream
+            xref = page.get_contents()[0]
+            content_stream = self.doc.xref_stream(xref).decode('latin-1')
+            
+            # Split by whitespace to get tokens
+            tokens = content_stream.split()
+            
+            # Track recent rectangles before fill
+            recent_rects = []
+            
+            i = 0
+            while i < len(tokens):
+                token = tokens[i]
+                
+                # Check for graphics state change: /[Name] gs
+                if token.startswith('/') and i + 1 < len(tokens) and tokens[i + 1] == 'gs':
+                    gs_match = re.match(r'/([A-Za-z]+\d*)', token)
+                    if gs_match:
+                        gs_name = gs_match.group(1)
+                        current_opacity = opacity_map.get(gs_name, 1.0)
+                    i += 2
+                    continue
+                
+                # Track rectangle construction: x y width height re
+                if token == 're' and i >= 4:
+                    try:
+                        rect_h = float(tokens[i - 1])
+                        rect_w = float(tokens[i - 2])
+                        rect_y = float(tokens[i - 3])
+                        rect_x = float(tokens[i - 4])
+                        recent_rects.append((rect_x, rect_y, abs(rect_w), abs(rect_h)))
+                    except (ValueError, IndexError):
+                        pass
+                
+                # Check for fill operations: 'f' or 'f*'
+                if token in ['f', 'f*']:
+                    # Record opacity for this fill operation
+                    opacity_info['sequence'].append(current_opacity)
+                    
+                    # If we have rectangle info, also store by size
+                    if recent_rects:
+                        # Use the most recent rectangle before this fill
+                        rect_x, rect_y, rect_w, rect_h = recent_rects[-1]
+                        # Store by size key for matching
+                        size_key = (round(rect_w, 0), round(rect_h, 0))
+                        if size_key not in opacity_info['by_size']:
+                            opacity_info['by_size'][size_key] = []
+                        opacity_info['by_size'][size_key].append(current_opacity)
+                        logger.debug(f"Fill op with opacity {current_opacity}, size {size_key}")
+                    
+                    # Clear rectangle buffer after fill
+                    recent_rects = []
+                
+                i += 1
+            
+            logger.debug(f"Extracted {len(opacity_info['sequence'])} opacity values in sequence")
+            logger.debug(f"Size-based groups: {len(opacity_info['by_size'])}")
+            
+        except Exception as e:
+            logger.debug(f"Could not parse enhanced opacity info: {e}")
+        
+        return opacity_info
+    
+    def _find_opacity_for_drawing(self, rect, opacity_info: Dict) -> float:
+        """
+        Find the opacity value for a drawing using multiple strategies.
+        
+        Strategy:
+        1. Match by size if the shape has a unique size in the opacity map
+        2. Use the corresponding index in the opacity sequence
+        3. Default to 1.0 (fully opaque)
+        
+        Args:
+            rect: PyMuPDF Rect object
+            opacity_info: Dictionary with opacity sequence and size-based mapping
+            
+        Returns:
+            Opacity value (default 1.0 if not found)
+        """
+        # Try matching by size for non-standard rectangles
+        size_key = (round(rect.width, 0), round(rect.height, 0))
+        
+        if 'by_size' in opacity_info and size_key in opacity_info['by_size']:
+            opacity_list = opacity_info['by_size'][size_key]
+            # If all rectangles of this size have the same opacity, use it
+            unique_opacities = list(set(opacity_list))
+            if len(unique_opacities) == 1:
+                logger.debug(f"Matched by size {size_key} to opacity {unique_opacities[0]}")
+                return unique_opacities[0]
+            # If there are multiple opacities for this size, pick based on distribution
+            # Prefer transparent over opaque (HTML background layers are typically more specific)
+            transparent_opacities = [o for o in unique_opacities if o < 0.5]
+            if transparent_opacities:
+                return min(transparent_opacities)  # Use the most transparent
+        
+        # Default to fully opaque
+        return 1.0
+    
     def _deduplicate_overlapping_shapes(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Remove duplicate overlapping shapes that are artifacts from HTML-to-PDF conversion.
@@ -456,6 +573,8 @@ class PDFParser:
         2. Their positions overlap significantly (within 2pt tolerance)
         3. Their sizes are nearly identical (within 2pt tolerance)
         4. They have different opacity values (one transparent, one opaque)
+        5. CRITICAL: The transparent and opaque versions must have VERY different opacity
+           (e.g., 0.03 vs 1.0, NOT 0.03 vs 0.08)
         
         Args:
             shape1: First shape element
@@ -476,11 +595,16 @@ class PDFParser:
         if abs(opacity1 - opacity2) < 0.001:
             return False
         
-        # One must be transparent (< 0.5) and one must be opaque (> 0.5)
-        has_transparent = min(opacity1, opacity2) < 0.5
-        has_opaque = max(opacity1, opacity2) > 0.5
+        # CRITICAL FIX: One must be transparent (< 0.5) and one must be FULLY opaque (>= 0.9)
+        # This prevents merging shapes with different non-opaque transparency levels
+        # e.g., prevents merging 0.03 with 0.08, but allows merging 0.03 with 1.0
+        min_opacity = min(opacity1, opacity2)
+        max_opacity = max(opacity1, opacity2)
         
-        if not (has_transparent and has_opaque):
+        has_transparent = min_opacity < 0.5
+        has_fully_opaque = max_opacity >= 0.9  # Changed from > 0.5 to >= 0.9
+        
+        if not (has_transparent and has_fully_opaque):
             return False
         
         # Check position overlap (tolerance: 2pt for slight positioning differences)
