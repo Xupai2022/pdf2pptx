@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Tuple
 from pathlib import Path
 import io
 from PIL import Image
+from .border_extractor import BorderExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ class PDFParser:
         self.min_text_size = config.get('min_text_size', 6)
         self.max_text_size = config.get('max_text_size', 72)
         self.doc = None
+        
+        # Initialize border extractor
+        self.border_extractor = BorderExtractor(config)
         
     def open(self, pdf_path: str) -> bool:
         """
@@ -328,6 +332,18 @@ class PDFParser:
                 }
                 
                 drawing_elements.append(element)
+            
+            # Extract borders from complex paths (e.g., rounded rectangles with border-left)
+            page_width = page.rect.width
+            border_elements = self.border_extractor.extract_borders_from_drawings(drawings, page_width)
+            
+            # Filter out duplicate borders that are already in drawing_elements
+            border_elements = self.border_extractor.filter_duplicate_borders(border_elements, drawing_elements)
+            
+            # Add extracted borders to drawing elements
+            if border_elements:
+                logger.info(f"Extracted {len(border_elements)} border element(s) from complex paths")
+                drawing_elements.extend(border_elements)
             
             # Deduplicate overlapping shapes (border artifacts from HTML-to-PDF conversion)
             drawing_elements = self._deduplicate_overlapping_shapes(drawing_elements)
