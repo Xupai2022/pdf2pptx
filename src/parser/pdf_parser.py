@@ -12,6 +12,7 @@ from PIL import Image
 from .border_detector import BorderDetector
 from .shape_merger import ShapeMerger
 from .chart_detector import ChartDetector
+from .text_image_overlap_detector import TextImageOverlapDetector
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +38,11 @@ class PDFParser:
         self.max_text_size = config.get('max_text_size', 72)
         self.doc = None
         
-        # Initialize border detector, shape merger, and chart detector
+        # Initialize border detector, shape merger, chart detector, and text overlap detector
         self.border_detector = BorderDetector(config)
         self.shape_merger = ShapeMerger(config)
         self.chart_detector = ChartDetector(config)
+        self.text_overlap_detector = TextImageOverlapDetector(overlap_threshold=0.5)
         
     def open(self, pdf_path: str) -> bool:
         """
@@ -172,6 +174,10 @@ class PDFParser:
         for shape in drawing_elements:
             if id(shape) not in chart_shape_ids:
                 page_data['elements'].append(shape)
+        
+        # Filter out text elements that overlap with chart images
+        if chart_regions:
+            page_data['elements'] = self.text_overlap_detector.filter_overlapping_texts(page_data['elements'])
         
         logger.info(f"Page {page_num}: Extracted {len(page_data['elements'])} elements ({len(chart_regions)} charts rendered as images)")
         
