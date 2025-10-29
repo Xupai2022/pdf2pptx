@@ -7,6 +7,12 @@ parser:
   image_format: "PNG"
   min_text_size: 6
   max_text_size: 72
+  
+  # Chart detection configuration
+  min_shapes_for_chart: 3  # Minimum number of shapes to form a chart
+  cluster_distance_threshold: 50  # Max distance (pt) between shapes in same cluster
+  min_chart_area: 10000  # Minimum chart area in pt²
+  chart_render_dpi: 600  # DPI for rendering charts as images (higher = sharper)
 
 # Layout Analysis Configuration
 analyzer:

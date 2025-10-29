@@ -11,6 +11,7 @@ import io
 from PIL import Image
 from .border_detector import BorderDetector
 from .shape_merger import ShapeMerger
+from .chart_detector import ChartDetector
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +37,10 @@ class PDFParser:
         self.max_text_size = config.get('max_text_size', 72)
         self.doc = None
         
-        # Initialize border detector and shape merger
+        # Initialize border detector, shape merger, and chart detector
         self.border_detector = BorderDetector(config)
         self.shape_merger = ShapeMerger(config)
+        self.chart_detector = ChartDetector(config)
         
     def open(self, pdf_path: str) -> bool:
         """
@@ -124,9 +126,54 @@ class PDFParser:
         
         # Extract shapes/drawings with opacity information
         drawing_elements = self._extract_drawings(page, opacity_map)
-        page_data['elements'].extend(drawing_elements)
         
-        logger.info(f"Page {page_num}: Extracted {len(page_data['elements'])} elements")
+        # Detect chart regions before adding shapes to elements
+        chart_regions = self.chart_detector.detect_chart_regions(page, drawing_elements)
+        
+        # Convert chart regions to high-resolution images
+        chart_shape_ids = set()
+        for chart_region in chart_regions:
+            # Render chart as image
+            chart_bbox = chart_region['bbox']
+            image_data = self.chart_detector.render_chart_as_image(page, chart_bbox)
+            
+            # Create image element to replace the chart shapes
+            chart_image_elem = {
+                'type': 'image',
+                'image_data': image_data,
+                'image_format': 'png',
+                'width_px': 0,  # Will be determined from image
+                'height_px': 0,
+                'x': chart_bbox[0],
+                'y': chart_bbox[1],
+                'x2': chart_bbox[2],
+                'y2': chart_bbox[3],
+                'width': chart_bbox[2] - chart_bbox[0],
+                'height': chart_bbox[3] - chart_bbox[1],
+                'image_id': f"page{page_num}_chart_{len(chart_regions)}",
+                'is_chart': True
+            }
+            
+            # Get actual image dimensions
+            try:
+                pil_image = Image.open(io.BytesIO(image_data))
+                chart_image_elem['width_px'] = pil_image.width
+                chart_image_elem['height_px'] = pil_image.height
+            except Exception as e:
+                logger.warning(f"Failed to get chart image dimensions: {e}")
+            
+            page_data['elements'].append(chart_image_elem)
+            
+            # Mark shapes in this chart region for exclusion
+            for shape in chart_region['shapes']:
+                chart_shape_ids.add(id(shape))
+        
+        # Add only non-chart shapes to elements
+        for shape in drawing_elements:
+            if id(shape) not in chart_shape_ids:
+                page_data['elements'].append(shape)
+        
+        logger.info(f"Page {page_num}: Extracted {len(page_data['elements'])} elements ({len(chart_regions)} charts rendered as images)")
         
         return page_data
     
@@ -216,6 +263,21 @@ class PDFParser:
                 if image_rects:
                     rect = image_rects[0]  # Use first occurrence
                     
+                    # Check if image is corrupted (all black or all white)
+                    is_corrupted = self._is_image_corrupted(pil_image)
+                    
+                    if is_corrupted:
+                        # Re-render the region as high-quality bitmap
+                        logger.warning(f"Detected corrupted embedded image at page {page_num}, re-rendering region")
+                        zoom = 4.0  # High resolution
+                        matrix = fitz.Matrix(zoom, zoom)
+                        region_pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=False)
+                        image_bytes = region_pix.tobytes("png")
+                        image_ext = "png"
+                        
+                        # Update PIL image
+                        pil_image = Image.open(io.BytesIO(image_bytes))
+                    
                     element = {
                         'type': 'image',
                         'image_data': image_bytes,
@@ -228,7 +290,8 @@ class PDFParser:
                         'y2': rect.y1,
                         'width': rect.width,
                         'height': rect.height,
-                        'image_id': f"page{page_num}_img{img_index}"
+                        'image_id': f"page{page_num}_img{img_index}",
+                        'was_rerendered': is_corrupted
                     }
                     
                     image_elements.append(element)
@@ -719,6 +782,68 @@ class PDFParser:
             all_pages.append(page_data)
         
         return all_pages
+    
+    def _is_image_corrupted(self, pil_image: Image.Image) -> bool:
+        """
+        Check if an image is corrupted (all black, all white, or single color).
+        
+        Args:
+            pil_image: PIL Image object
+            
+        Returns:
+            True if image appears to be corrupted
+        """
+        try:
+            # Sample pixels from different regions
+            width, height = pil_image.size
+            
+            # Skip very small images
+            if width < 10 or height < 10:
+                return False
+            
+            # Sample 9 points (corners, edges, center)
+            sample_points = [
+                (0, 0),  # Top-left
+                (width // 2, 0),  # Top-center
+                (width - 1, 0),  # Top-right
+                (0, height // 2),  # Left-center
+                (width // 2, height // 2),  # Center
+                (width - 1, height // 2),  # Right-center
+                (0, height - 1),  # Bottom-left
+                (width // 2, height - 1),  # Bottom-center
+                (width - 1, height - 1)  # Bottom-right
+            ]
+            
+            pixels = []
+            for x, y in sample_points:
+                try:
+                    pixel = pil_image.getpixel((x, y))
+                    # Convert to tuple if not already
+                    if not isinstance(pixel, tuple):
+                        pixel = (pixel, pixel, pixel)
+                    pixels.append(pixel)
+                except:
+                    continue
+            
+            if not pixels:
+                return False
+            
+            # Check if all pixels are the same (single color)
+            first_pixel = pixels[0]
+            all_same = all(p == first_pixel for p in pixels)
+            
+            if not all_same:
+                return False
+            
+            # Check if the single color is black (0,0,0) or white (255,255,255)
+            is_black = all(c <= 5 for c in first_pixel[:3])
+            is_white = all(c >= 250 for c in first_pixel[:3])
+            
+            return is_black or is_white
+            
+        except Exception as e:
+            logger.debug(f"Error checking image corruption: {e}")
+            return False
     
     def __enter__(self):
         """Context manager entry."""
