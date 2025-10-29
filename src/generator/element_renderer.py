@@ -193,11 +193,28 @@ class ElementRenderer:
                 'rect': MSO_SHAPE.RECTANGLE,
                 'circle': MSO_SHAPE.OVAL,
                 'oval': MSO_SHAPE.OVAL,
+                'ellipse': MSO_SHAPE.OVAL,
                 'line': MSO_SHAPE.RECTANGLE,  # Default to rectangle
-                'path': MSO_SHAPE.RECTANGLE
+                'path': MSO_SHAPE.RECTANGLE,
+                'f': MSO_SHAPE.RECTANGLE,  # Fill path - default to rectangle
+                's': MSO_SHAPE.RECTANGLE   # Stroke path - default to rectangle
             }
             
-            mso_shape = shape_map.get(shape_type.lower(), MSO_SHAPE.RECTANGLE)
+            # Override with OVAL if marked as a ring or if aspect ratio suggests circle
+            aspect_ratio = position['width'] / position['height'] if position['height'] > 0 else 0
+            is_circular = 0.8 <= aspect_ratio <= 1.2  # Nearly square suggests circular
+            
+            # Check if this is a merged ring shape
+            is_ring = style.get('is_ring', False)
+            
+            if is_ring:
+                # Ring shapes must be rendered as OVAL (circle) with stroke
+                mso_shape = MSO_SHAPE.OVAL
+                logger.debug(f"Rendering ring shape at ({position['x']:.1f}, {position['y']:.1f})")
+            elif is_circular and shape_type.lower() == 'oval':
+                mso_shape = MSO_SHAPE.OVAL
+            else:
+                mso_shape = shape_map.get(shape_type.lower(), MSO_SHAPE.RECTANGLE)
             
             # Add shape
             shape = slide.shapes.add_shape(mso_shape, left, top, width, height)

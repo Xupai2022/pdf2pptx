@@ -10,6 +10,7 @@ from pathlib import Path
 import io
 from PIL import Image
 from .border_detector import BorderDetector
+from .shape_merger import ShapeMerger
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,9 @@ class PDFParser:
         self.max_text_size = config.get('max_text_size', 72)
         self.doc = None
         
-        # Initialize border detector
+        # Initialize border detector and shape merger
         self.border_detector = BorderDetector(config)
+        self.shape_merger = ShapeMerger(config)
         
     def open(self, pdf_path: str) -> bool:
         """
@@ -338,6 +340,10 @@ class PDFParser:
             # Borders are created by pairs of overlapping shapes with small offsets
             # We must detect them before deduplication removes the duplicate shapes
             border_elements = self.border_detector.detect_borders_from_shapes(drawing_elements)
+            
+            # Merge composite shapes (rings, donuts, etc.) BEFORE deduplication
+            # This must happen before deduplication to preserve the overlapping shapes
+            drawing_elements = self.shape_merger.merge_shapes(drawing_elements)
             
             # Now deduplicate overlapping shapes (removes border artifacts)
             drawing_elements = self._deduplicate_overlapping_shapes(drawing_elements)

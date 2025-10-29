@@ -141,15 +141,21 @@ class StyleMapper:
             # Stroke/line color and width
             stroke_color = style.get('stroke_color')
             stroke_width = style.get('stroke_width')
+            is_ring = style.get('is_ring', False)
             
             # Determine if border should be rendered
             # Border should NOT be rendered if:
             # 1. stroke_width is None or 0
             # 2. stroke_color is None or "None" string
             # 3. stroke_color is default black (#000000) AND stroke_width is None (PDF default)
+            # EXCEPTION: Ring shapes always render their stroke (it's the ring itself)
             should_render_border = False
             
-            if stroke_color and stroke_color not in ['None', '#000000']:
+            if is_ring:
+                # For ring shapes, always render the stroke (it's the ring color)
+                should_render_border = True
+                logger.debug(f"Ring shape detected, rendering stroke as ring")
+            elif stroke_color and stroke_color not in ['None', '#000000']:
                 # Explicit non-black stroke color
                 if stroke_width is not None and stroke_width > 0:
                     should_render_border = True

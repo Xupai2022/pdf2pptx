@@ -133,7 +133,9 @@ class CoordinateMapper:
                         'stroke_color': elem.get('stroke_color'),
                         'stroke_width': elem.get('stroke_width', 1),
                         'role': role,  # Pass role to style for transparency mapping
-                        'is_border': is_border  # Flag for border-specific handling
+                        'is_border': is_border,  # Flag for border-specific handling
+                        'is_ring': elem.get('is_ring', False),  # Flag for ring shapes
+                        'ring_color': elem.get('ring_color')  # Original ring color if applicable
                     }
                     shape_position = self._pdf_to_slide_coords(
                         [elem['x'], elem['y'], elem['x2'], elem['y2']],
