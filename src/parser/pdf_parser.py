@@ -13,6 +13,7 @@ from .border_detector import BorderDetector
 from .shape_merger import ShapeMerger
 from .chart_detector import ChartDetector
 from .text_image_overlap_detector import TextImageOverlapDetector
+from .icon_font_detector import IconFontDetector
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,12 @@ class PDFParser:
         self.max_text_size = config.get('max_text_size', 72)
         self.doc = None
         
-        # Initialize border detector, shape merger, chart detector, and text overlap detector
+        # Initialize border detector, shape merger, chart detector, text overlap detector, and icon detector
         self.border_detector = BorderDetector(config)
         self.shape_merger = ShapeMerger(config)
         self.chart_detector = ChartDetector(config)
         self.text_overlap_detector = TextImageOverlapDetector(overlap_threshold=0.5)
+        self.icon_detector = IconFontDetector(config)
         
     def open(self, pdf_path: str) -> bool:
         """
@@ -117,9 +119,25 @@ class PDFParser:
         # Extract ExtGState opacity mapping for this page
         opacity_map = self._extract_opacity_map(page)
         
-        # Extract text blocks
+        # Extract icon fonts as images BEFORE extracting regular text
+        # This prevents icon characters from being rendered as text
+        icon_images = self.icon_detector.extract_icons_from_page(page, page_num)
+        if icon_images:
+            page_data['elements'].extend(icon_images)
+            logger.info(f"Page {page_num}: Extracted {len(icon_images)} icon font(s) as images")
+        
+        # Extract text blocks (icons will be filtered out)
         text_elements = self._extract_text_blocks(page)
-        page_data['elements'].extend(text_elements)
+        
+        # Filter out text elements that are icons
+        icon_indices = self.icon_detector.get_icon_text_indices(text_elements)
+        filtered_text_elements = [
+            elem for i, elem in enumerate(text_elements) if i not in icon_indices
+        ]
+        page_data['elements'].extend(filtered_text_elements)
+        
+        if icon_indices:
+            logger.info(f"Page {page_num}: Filtered out {len(icon_indices)} icon font text element(s)")
         
         # Extract images
         if self.extract_images:
@@ -791,27 +809,16 @@ class PDFParser:
     
     def _is_image_corrupted(self, pil_image: Image.Image) -> bool:
         """
-        Check if an image is corrupted or low-quality that should be re-rendered.
-        
-        This method detects:
-        1. Completely black or white images (corruption)
-        2. Low-quality icon images with white backgrounds (needs re-rendering)
-        
-        Low-quality icons are characterized by:
-        - No alpha channel (RGB mode instead of RGBA)
-        - White or near-white background
-        - Low resolution (< 100 pixels in any dimension)
-        - Limited color palette (< 200 unique colors)
+        Check if an image is corrupted (all black, all white, or single color).
         
         Args:
             pil_image: PIL Image object
             
         Returns:
-            True if image should be re-rendered for better quality
+            True if image appears to be corrupted
         """
         try:
-            import numpy as np
-            
+            # Sample pixels from different regions
             width, height = pil_image.size
             
             # Skip very small images
@@ -845,81 +852,21 @@ class PDFParser:
             if not pixels:
                 return False
             
-            # Check 1: All sampled pixels are the same (single color corruption)
+            # Check if all pixels are the same (single color)
             first_pixel = pixels[0]
             all_same = all(p == first_pixel for p in pixels)
             
-            if all_same:
-                # Check if the single color is black (0,0,0) or white (255,255,255)
-                is_black = all(c <= 5 for c in first_pixel[:3])
-                is_white = all(c >= 250 for c in first_pixel[:3])
-                
-                if is_black or is_white:
-                    return True
+            if not all_same:
+                return False
             
-            # Check 2: Low-quality icon detection (white background, no alpha, low resolution)
-            # This detects icons that were embedded as RGB images with white backgrounds
+            # Check if the single color is black (0,0,0) or white (255,255,255)
+            is_black = all(c <= 5 for c in first_pixel[:3])
+            is_white = all(c >= 250 for c in first_pixel[:3])
             
-            # Condition 1: No alpha channel (RGB mode)
-            has_no_alpha = pil_image.mode == 'RGB'
-            
-            # Condition 2: Low resolution (typical for low-quality icons)
-            is_low_res = (width <= 100 or height <= 100)
-            
-            if has_no_alpha and is_low_res:
-                # Convert to numpy for efficient analysis
-                img_array = np.array(pil_image)
-                
-                # Condition 3: Check corners for white background
-                corner_pixels = [
-                    img_array[0, 0],
-                    img_array[0, -1],
-                    img_array[-1, 0],
-                    img_array[-1, -1]
-                ]
-                # At least 2 corners should be white (allows for icon content in other corners)
-                white_corner_count = sum(1 for corner in corner_pixels if np.all(corner >= 250))
-                has_white_corners = white_corner_count >= 2
-                
-                # Condition 4: Check if image has predominantly white background
-                white_pixels = np.sum(np.all(img_array >= 250, axis=-1))
-                total_pixels = img_array.shape[0] * img_array.shape[1]
-                white_ratio = white_pixels / total_pixels
-                has_white_background = white_ratio > 0.05  # More than 5% white pixels
-                
-                # Condition 5: Limited color palette (typical for icons)
-                unique_colors = len(np.unique(img_array.reshape(-1, img_array.shape[-1]), axis=0))
-                has_limited_palette = unique_colors < 200
-                
-                # Condition 6: Check for solid color background (any color)
-                # Find most common color - likely the background
-                pixels_flat = img_array.reshape(-1, img_array.shape[-1])
-                unique_pixels, counts = np.unique(pixels_flat, axis=0, return_counts=True)
-                most_common_count = np.max(counts)
-                bg_ratio = most_common_count / total_pixels
-                has_solid_background = bg_ratio > 0.4  # More than 40% single color = likely icon with solid bg
-                
-                # If sufficient conditions are met, this is a low-quality icon that should be re-rendered
-                # Strategy: 
-                # 1. White background icons: has_white_corners OR white_ratio > 0.1
-                # 2. Solid color background icons: has_solid_background
-                # All must have limited_palette
-                has_icon_characteristics = (
-                    (has_white_corners or (white_ratio > 0.1) or has_solid_background)
-                    and has_limited_palette
-                )
-                
-                if has_icon_characteristics:
-                    logger.debug(f"Detected low-quality icon image: {width}x{height}, "
-                               f"{unique_colors} colors, {white_ratio:.1%} white pixels, "
-                               f"{white_corner_count}/4 white corners, "
-                               f"{bg_ratio:.1%} solid background")
-                    return True
-            
-            return False
+            return is_black or is_white
             
         except Exception as e:
-            logger.debug(f"Error checking image quality: {e}")
+            logger.debug(f"Error checking image corruption: {e}")
             return False
     
     def __enter__(self):
