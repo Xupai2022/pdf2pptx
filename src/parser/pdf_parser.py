@@ -208,10 +208,23 @@ class PDFParser:
                             continue
                         
                         bbox = span.get("bbox", [0, 0, 0, 0])
-                        text = span.get("text", "").strip()
+                        text_raw = span.get("text", "")
+                        text = text_raw.strip()
+                        font_name = span.get("font", "")
+                        
+                        # Special handling for symbol/emoji fonts:
+                        # These fonts may use whitespace characters to represent symbols
+                        # (e.g., SegoeUISymbol, SegoeUIEmoji, icon fonts)
+                        # Don't skip them even if they contain only whitespace
+                        is_symbol_font = any(keyword in font_name for keyword in 
+                                            ['Symbol', 'Emoji', 'Icon', 'Wingding', 'Webding', 'Dingbat'])
                         
                         if not text:
-                            continue
+                            # Skip empty text UNLESS it's a symbol font with whitespace
+                            if not (is_symbol_font and text_raw):
+                                continue
+                            # For symbol fonts, use the raw text (preserve whitespace)
+                            text = text_raw
                         
                         element = {
                             'type': 'text',
@@ -222,13 +235,19 @@ class PDFParser:
                             'y2': bbox[3],
                             'width': bbox[2] - bbox[0],
                             'height': bbox[3] - bbox[1],
-                            'font_name': span.get("font", ""),
+                            'font_name': font_name,
                             'font_size': font_size,
                             'color': self._rgb_to_hex(span.get("color", 0)),
                             'flags': span.get("flags", 0),  # bold, italic, etc.
                             'is_bold': bool(span.get("flags", 0) & 2**4),
                             'is_italic': bool(span.get("flags", 0) & 2**1)
                         }
+                        
+                        # Log symbol font extractions for debugging
+                        if is_symbol_font and text_raw != text:
+                            logger.debug(f"Extracted symbol font text: font={font_name}, "
+                                       f"raw='{text_raw}' ({len(text_raw)} chars), "
+                                       f"position=({bbox[0]:.1f}, {bbox[1]:.1f})")
                         
                         text_elements.append(element)
         
