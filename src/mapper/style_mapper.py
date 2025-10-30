@@ -82,7 +82,8 @@ class StyleMapper:
             run.font.name = mapped_font
             run.font.size = Pt(font_size)
             
-            if self.preserve_colors:
+            # Only apply color if valid RGB was extracted
+            if self.preserve_colors and rgb is not None:
                 run.font.color.rgb = RGBColor(*rgb)
             
             run.font.bold = is_bold
@@ -124,9 +125,20 @@ class StyleMapper:
                 # Opacity was extracted from PDF
                 logger.debug(f"Using PDF-extracted opacity: {fill_opacity:.3f} for color {fill_color}")
             
-            if fill_color and fill_color != 'None' and self.preserve_colors:
+            # Handle fill color
+            # fill_color can be:
+            #   - None: stroke-only shape (no fill) -> set transparent fill
+            #   - "None": invalid value -> set transparent fill
+            #   - hex color string: normal fill color
+            if fill_color is None or fill_color == 'None':
+                # Stroke-only shape or invalid fill - make fill transparent
+                shape.fill.background()
+                logger.debug(f"No fill color (stroke-only shape): fill_color={fill_color}")
+            elif self.preserve_colors:
+                # Normal fill color - convert and apply
                 rgb = self.hex_to_rgb(fill_color)
-                if rgb != (0, 0, 0) or fill_color.lower() in ['#000000', '#000']:
+                # Apply fill for any valid color (including black #000000 and white #FFFFFF)
+                if rgb is not None:
                     shape.fill.solid()
                     shape.fill.fore_color.rgb = RGBColor(*rgb)
                     
@@ -137,6 +149,10 @@ class StyleMapper:
                     if fill_opacity < 1.0:
                         self._set_shape_transparency(shape, fill_opacity)
                         logger.debug(f"Set shape transparency: opacity {fill_opacity:.2f}")
+                else:
+                    # hex_to_rgb failed - make fill transparent
+                    shape.fill.background()
+                    logger.warning(f"Invalid fill color: {fill_color}")
             
             # Stroke/line color and width
             stroke_color = style.get('stroke_color')
@@ -183,13 +199,13 @@ class StyleMapper:
         Convert hex color to RGB tuple.
         
         Args:
-            hex_color: Hex color string (e.g., '#FF0000')
+            hex_color: Hex color string (e.g., '#FF0000'), or None
             
         Returns:
-            RGB tuple (r, g, b)
+            RGB tuple (r, g, b), or None if conversion fails
         """
         if not hex_color or not isinstance(hex_color, str):
-            return (0, 0, 0)
+            return None
         
         # Remove '#' if present
         hex_color = hex_color.lstrip('#')
@@ -209,7 +225,7 @@ class StyleMapper:
         except ValueError:
             logger.warning(f"Invalid hex color: {hex_color}")
         
-        return (0, 0, 0)
+        return None
     
     def rgba_to_rgb_opacity(self, rgba_str: str) -> tuple:
         """
@@ -219,12 +235,12 @@ class StyleMapper:
             rgba_str: RGBA string like 'rgba(10, 66, 117, 0.08)'
             
         Returns:
-            Tuple of (rgb_tuple, opacity_float)
+            Tuple of (rgb_tuple or None, opacity_float)
         """
         import re
         
         if not rgba_str or not isinstance(rgba_str, str):
-            return ((0, 0, 0), 1.0)
+            return (None, 1.0)
         
         # Parse rgba(r, g, b, a) format
         match = re.match(r'rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)', rgba_str)
@@ -236,9 +252,10 @@ class StyleMapper:
         
         # If not RGBA, try hex
         if rgba_str.startswith('#'):
-            return (self.hex_to_rgb(rgba_str), 1.0)
+            rgb = self.hex_to_rgb(rgba_str)
+            return (rgb, 1.0)
         
-        return ((0, 0, 0), 1.0)
+        return (None, 1.0)
     
     def _set_shape_transparency(self, shape, opacity: float):
         """

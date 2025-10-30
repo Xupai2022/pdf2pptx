@@ -764,13 +764,15 @@ class PDFParser:
         Convert RGB color to hex format.
         
         Args:
-            color: Color value (int or tuple)
+            color: Color value (int or tuple), or None for no fill
             
         Returns:
-            Hex color string
+            Hex color string, or None if color is None (no fill)
         """
         if color is None:
-            return "#000000"
+            # Return None for stroke-only shapes (no fill)
+            # This prevents treating unfilled shapes as black rectangles
+            return None
         
         if isinstance(color, int):
             # Convert integer to RGB
@@ -784,7 +786,9 @@ class PDFParser:
             r, g, b = int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
             return f"#{r:02X}{g:02X}{b:02X}"
         
-        return "#000000"
+        # Fallback for unexpected color format
+        logger.warning(f"Unexpected color format: {color} (type: {type(color)})")
+        return None
     
     def extract_all_pages(self) -> List[Dict[str, Any]]:
         """
