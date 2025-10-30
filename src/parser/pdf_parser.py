@@ -809,16 +809,24 @@ class PDFParser:
     
     def _is_image_corrupted(self, pil_image: Image.Image) -> bool:
         """
-        Check if an image is corrupted (all black, all white, or single color).
+        Check if an image is corrupted or is a low-quality embedded icon that should be re-rendered.
+        
+        This method detects two types of problematic images:
+        1. Truly corrupted images (all black, all white, or single color)
+        2. Low-quality embedded PNG icons (small size, limited colors, no alpha)
+        
+        CRITICAL: This method ONLY processes embedded images extracted from PDF.
+        Vector shapes are NOT passed to this method, so they remain untouched.
         
         Args:
-            pil_image: PIL Image object
+            pil_image: PIL Image object from embedded image extraction
             
         Returns:
-            True if image appears to be corrupted
+            True if image should be re-rendered for better quality
         """
         try:
-            # Sample pixels from different regions
+            import numpy as np
+            
             width, height = pil_image.size
             
             # Skip very small images
@@ -852,21 +860,50 @@ class PDFParser:
             if not pixels:
                 return False
             
-            # Check if all pixels are the same (single color)
+            # Check 1: Truly corrupted - all pixels are the same (single color)
             first_pixel = pixels[0]
             all_same = all(p == first_pixel for p in pixels)
             
-            if not all_same:
-                return False
+            if all_same:
+                # Only re-render if it's black or white (truly corrupted)
+                is_black = all(c <= 5 for c in first_pixel[:3])
+                is_white = all(c >= 250 for c in first_pixel[:3])
+                
+                if is_black or is_white:
+                    logger.debug(f"Detected truly corrupted image: {width}x{height}, all {('black' if is_black else 'white')}")
+                    return True
             
-            # Check if the single color is black (0,0,0) or white (255,255,255)
-            is_black = all(c <= 5 for c in first_pixel[:3])
-            is_white = all(c >= 250 for c in first_pixel[:3])
+            # Check 2: Low-quality embedded icon detection
+            # These are small PNG icons with no alpha channel and limited colors
+            # IMPORTANT: This check only applies to embedded images, NOT vector shapes
             
-            return is_black or is_white
+            # Condition 1: No alpha channel (RGB mode)
+            has_no_alpha = pil_image.mode == 'RGB'
+            
+            # Condition 2: Small size (typical for icons)
+            is_small = (width <= 100 or height <= 100)
+            
+            # Only proceed if both conditions are met
+            if has_no_alpha and is_small:
+                # Convert to numpy for efficient analysis
+                img_array = np.array(pil_image)
+                
+                # Condition 3: Limited color palette (typical for icons)
+                unique_colors = len(np.unique(img_array.reshape(-1, img_array.shape[-1]), axis=0))
+                has_limited_palette = unique_colors < 200
+                
+                if has_limited_palette:
+                    # This is likely a low-quality embedded icon
+                    logger.info(
+                        f"Detected low-quality embedded icon: {width}x{height}px, "
+                        f"{unique_colors} colors, RGB mode - will re-render for better quality"
+                    )
+                    return True
+            
+            return False
             
         except Exception as e:
-            logger.debug(f"Error checking image corruption: {e}")
+            logger.debug(f"Error checking image quality: {e}")
             return False
     
     def __enter__(self):
