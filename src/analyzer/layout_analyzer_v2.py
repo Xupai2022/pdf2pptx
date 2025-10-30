@@ -3,6 +3,7 @@ Layout Analyzer V2 - Improved layout analysis with better text grouping
 """
 
 import logging
+import re
 from typing import List, Dict, Any
 from ..parser.element_extractor import ElementExtractor
 
@@ -27,6 +28,100 @@ class LayoutAnalyzerV2:
         self.group_tolerance = config.get('group_tolerance', 10)
         self.detect_headers = config.get('detect_headers', True)
         self.detect_footers = config.get('detect_footers', True)
+    
+    @staticmethod
+    def _is_purely_numeric(text: str) -> bool:
+        """检查文本是否纯数字（可包含小数点、逗号、百分号）"""
+        if not text:
+            return False
+        # 移除常见的数字分隔符和符号
+        cleaned = text.replace(',', '').replace('.', '').replace(' ', '').replace('%', '')
+        return cleaned.isdigit()
+    
+    @staticmethod
+    def _is_purely_alphabetic(text: str) -> bool:
+        """检查文本是否纯ASCII字母（不包括中文等）"""
+        if not text:
+            return False
+        cleaned = text.replace(' ', '')
+        return cleaned.isalpha() and cleaned.isascii()
+    
+    @staticmethod
+    def _has_cjk_characters(text: str) -> bool:
+        """检查文本是否包含CJK字符（中日韩文字）或CJK标点符号"""
+        if not text:
+            return False
+        # CJK Unicode ranges including punctuation
+        # \u4e00-\u9fff: CJK Unified Ideographs
+        # \u3400-\u4dbf: CJK Extension A
+        # \u3040-\u309f: Hiragana
+        # \u30a0-\u30ff: Katakana
+        # \u3000-\u303f: CJK Symbols and Punctuation
+        # \uff00-\uffef: Halfwidth and Fullwidth Forms (包括全角标点)
+        cjk_pattern = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\u3000-\u303f\uff00-\uffef]')
+        return bool(cjk_pattern.search(text))
+    
+    @staticmethod
+    def _should_merge_based_on_content(text1: str, text2: str, gap: float) -> tuple:
+        """
+        根据文本内容和间距判断是否应该合并
+        
+        关键规则：
+        1. 如果gap <= 1pt：紧密相邻，应该合并（如"8个"）
+        2. 如果gap > 2pt：如果一个是纯数字，另一个是中文，则不合并（语义分隔）
+        3. 如果gap > 2pt：如果一个是纯字母，另一个是中文，则不合并
+        4. 如果gap > 3pt且<=10pt：只有纯中文（非数字非字母）才考虑合并
+        
+        Args:
+            text1: 第一个文本
+            text2: 第二个文本
+            gap: 两个文本之间的间距（pt）
+            
+        Returns:
+            (should_merge, reason) 元组
+        """
+        # 规则1：紧密相邻，无条件合并
+        if gap <= 1.0:
+            return (True, "紧密相邻")
+        
+        # 检查内容类型
+        text1_is_number = LayoutAnalyzerV2._is_purely_numeric(text1)
+        text2_is_number = LayoutAnalyzerV2._is_purely_numeric(text2)
+        text1_is_alpha = LayoutAnalyzerV2._is_purely_alphabetic(text1)
+        text2_is_alpha = LayoutAnalyzerV2._is_purely_alphabetic(text2)
+        text1_has_cjk = LayoutAnalyzerV2._has_cjk_characters(text1)
+        text2_has_cjk = LayoutAnalyzerV2._has_cjk_characters(text2)
+        
+        # 规则2：纯数字 + 中文，且gap > 2pt，不合并（解决"44 起服务外"重叠问题）
+        if gap > 2.0:
+            if (text1_is_number and text2_has_cjk) or (text1_has_cjk and text2_is_number):
+                return (False, f"数字与中文分隔")
+            
+            # 规则3：纯字母 + 中文，且gap > 2pt，不合并
+            if (text1_is_alpha and text2_has_cjk) or (text1_has_cjk and text2_is_alpha):
+                return (False, f"字母与中文分隔")
+        
+        # 规则4：中等间距（1-3pt），只有相同类型才合并
+        if 1.0 < gap <= 3.0:
+            # 如果两个都是中文（非数字），可以合并
+            if text1_has_cjk and text2_has_cjk and not text1_is_number and not text2_is_number:
+                return (True, "中文连续")
+            # 如果两个都是数字，可以合并
+            if text1_is_number and text2_is_number:
+                return (True, "数字连续")
+            # 其他情况不合并
+            return (False, "内容类型不同")
+        
+        # 规则5：较大间距（>3pt），默认不合并，除非是纯中文词组
+        if gap > 3.0:
+            # 只有纯中文（非数字非字母）才考虑合并
+            if (text1_has_cjk and not text1_is_number and not text1_is_alpha and
+                text2_has_cjk and not text2_is_number and not text2_is_alpha):
+                if gap <= 10.0:  # 仍然限制在合理范围内
+                    return (True, "中文词组")
+            return (False, "间距过大")
+        
+        return (True, "默认合并")
     
     def analyze_page(self, page_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -208,49 +303,71 @@ class LayoutAnalyzerV2:
                 same_style = (elem_is_bold == other_is_bold) and (elem_is_italic == other_is_italic)
                 
                 # Group if on same line and close horizontal proximity
-                # Use very small gap tolerance (1pt) for tightly-coupled text like "8个", "高危4"
-                # Use larger tolerance (30pt) for related text with spacing
+                # Use content-aware merging to prevent overlaps
                 if y_diff <= self.group_tolerance:
                     should_group = False
+                    merge_reason = ""
                     
-                    # Very close elements (gap ≤ 1pt, allow negative for overlaps)
                     # Check both directions: element could be to the left or right
+                    actual_gap = x_gap
                     
                     # Direction 1: Check if other element is directly to our RIGHT
                     # Allow small negative gaps (down to -1pt) for slight overlaps
-                    if -1.0 <= x_gap <= 1.0:
-                        # Only group if same font size, color AND style (bold/italic)
-                        if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color and same_style:
-                            should_group = True
-                            if elem.get('content', '') in ['8', '高危', '4', '12', '19']:
-                                logger.debug(f"  → Grouping '{other.get('content', '')}' on RIGHT (gap={x_gap:.2f}pt)")
+                    if x_gap >= -1.0:
+                        # Use content-based merging logic
+                        elem_text = elem.get('content', '')
+                        other_text = other.get('content', '')
+                        
+                        # First check style compatibility
+                        style_compatible = (
+                            abs(other_font_size - elem_font_size) <= 2 and
+                            other_color == elem_color and
+                            same_style
+                        )
+                        
+                        if style_compatible:
+                            # Use absolute value of gap for content analysis
+                            merge_result = self._should_merge_based_on_content(
+                                elem_text, other_text, abs(actual_gap)
+                            )
+                            should_group, merge_reason = merge_result
                     
                     # Direction 2: Check if other element is directly to our LEFT
-                    # Calculate gap from other's right edge to our left edge
                     elif x_gap < 0:
                         other_x2 = other.get('x2', other_x)
                         left_gap = elem_x - other_x2
-                        # Only group if they are adjacent (gap ≤ 1pt) and same style
-                        if -1.0 <= left_gap <= 1.0:
-                            if abs(other_font_size - elem_font_size) <= 2 and other_color == elem_color and same_style:
-                                should_group = True
-                                if elem.get('content', '') in ['8', '高危', '4', '12', '19']:
-                                    logger.debug(f"  → Grouping '{other.get('content', '')}' on LEFT (left_gap={left_gap:.2f}pt)")
-                    elif elem.get('content', '') in ['4', '12', '19'] and y_diff <= self.group_tolerance and other.get('content', '') in ['高危', '中危', '低危']:
-                        logger.debug(f"  × Checking '{other.get('content', '')}' after '{ elem.get('content', '')}' (gap={x_gap:.2f}pt, y_diff={y_diff:.2f}pt)")
-                    # Moderate distance (1pt < gap ≤ 30pt) - group only if same style
-                    elif 1.0 < x_gap <= self.group_tolerance * 3:
-                        if other_font_size == elem_font_size and other_color == elem_color and same_style:
-                            should_group = True
-                            if elem.get('content', '') in ['8', '高危']:
-                                logger.debug(f"  → Grouping '{other.get('content', '')}' (gap={x_gap:.2f}pt, moderate)")
-                    elif elem.get('content', '') in ['8', '高危'] and y_diff <= self.group_tolerance and other.get('content', '') in ['个', '4']:
-                        logger.debug(f"  × Skipping '{other.get('content', '')}' (gap={x_gap:.2f}pt, y_diff={y_diff:.2f}pt)")
+                        
+                        if left_gap >= -1.0:
+                            elem_text = elem.get('content', '')
+                            other_text = other.get('content', '')
+                            
+                            style_compatible = (
+                                abs(other_font_size - elem_font_size) <= 2 and
+                                other_color == elem_color and
+                                same_style
+                            )
+                            
+                            if style_compatible:
+                                # Reverse order since other is on the left
+                                merge_result = self._should_merge_based_on_content(
+                                    other_text, elem_text, abs(left_gap)
+                                )
+                                should_group, merge_reason = merge_result
                     
                     if should_group:
                         group_elements.append(other)
                         processed.add(id(other))
                         current_x2 = max(current_x2, other_x2)
+                        
+                        # Log merging decisions for debugging
+                        if abs(actual_gap) > 2.0:
+                            logger.debug(f"Merging '{elem.get('content', '')}' + '{other.get('content', '')}' "
+                                       f"(gap={actual_gap:.2f}pt, reason={merge_reason})")
+                    else:
+                        # Log when we skip merging for interesting cases
+                        if 2.0 < abs(x_gap) <= 10.0 and merge_reason:
+                            logger.debug(f"Not merging '{elem.get('content', '')}' + '{other.get('content', '')}' "
+                                       f"(gap={x_gap:.2f}pt, reason={merge_reason})")
             
             # Create region
             bbox = self._calculate_bbox(group_elements)
@@ -258,17 +375,34 @@ class LayoutAnalyzerV2:
             # Sort group elements by x position before merging text
             sorted_group = sorted(group_elements, key=lambda e: e.get('x', 0))
             
-            # Merge text (without spaces for elements with gap ≤ 1pt)
+            # Merge text (智能添加空格：CJK字符之间不加空格，其他情况根据gap判断)
             text_parts = []
             for i, e in enumerate(sorted_group):
                 if i > 0:
                     # Check gap with previous element
-                    prev_x2 = sorted_group[i-1].get('x2', sorted_group[i-1].get('x', 0))
+                    prev_elem = sorted_group[i-1]
+                    prev_x2 = prev_elem.get('x2', prev_elem.get('x', 0))
                     curr_x = e.get('x', 0)
                     gap = curr_x - prev_x2
-                    # Add space only if gap > 1pt
+                    
+                    # 智能空格添加规则:
+                    # 1. gap <= 1pt: 不加空格（紧密相邻）
+                    # 2. gap > 1pt: 检查内容类型
+                    #    - 如果都是CJK字符（包括标点），不加空格
+                    #    - 否则，加空格
                     if gap > 1.0:
-                        text_parts.append(' ')
+                        prev_text = prev_elem.get('content', '')
+                        curr_text = e.get('content', '')
+                        
+                        # 检查是否都包含CJK字符
+                        prev_has_cjk = self._has_cjk_characters(prev_text)
+                        curr_has_cjk = self._has_cjk_characters(curr_text)
+                        
+                        # 只有在不都是CJK时才加空格
+                        # CJK文字和标点之间不需要空格
+                        if not (prev_has_cjk and curr_has_cjk):
+                            text_parts.append(' ')
+                
                 text_parts.append(e.get('content', ''))
             text_content = ''.join(text_parts)
             
