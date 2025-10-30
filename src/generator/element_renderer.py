@@ -46,16 +46,70 @@ class ElementRenderer:
         original_content = content
         
         # Clean content - remove ONLY control characters that cause XML issues
+        # Map private use area characters and non-characters to their standard Unicode equivalents
+        # These are often used in PDFs for symbol fonts but aren't XML-compatible
         if isinstance(content, str):
+            import re
+            
+            # Map common private use area characters to standard Unicode
+            # Based on common symbol font mappings (Wingdings, Webdings, Font Awesome, etc.)
+            # Font Awesome uses U+F000-U+F2FF range for icon glyphs
+            symbol_map = {
+                # Font Awesome icons (U+F000-U+F2FF range)
+                '\uf002': '🔍',  # search
+                '\uf007': '👤',  # user
+                '\uf013': '⚙',  # cog / settings
+                '\uf015': '🏠',  # home
+                '\uf019': '⬇',  # download
+                '\uf01c': '📁',  # folder
+                '\uf023': '🔒',  # lock
+                '\uf024': '$',  # dollar
+                '\uf044': '$',  # dollar alternate
+                '\uf055': '➕',  # plus-circle
+                '\uf058': '✓',  # check-circle
+                '\uf059': '❓',  # question-circle  
+                '\uf05a': 'ℹ',  # info-circle
+                '\uf05e': '🚫',  # ban / prohibited
+                '\uf06a': '●',  # circle / bullet
+                '\uf06e': '👁',  # eye
+                '\uf071': '⚠',  # exclamation-triangle / warning
+                '\uf073': '📅',  # calendar
+                '\uf084': '🔑',  # key
+                '\uf0c9': '☰',  # bars / menu
+                '\uf0f6': '➕',  # plus-square
+                '\uf146': '➖',  # minus-square
+                '\uf188': '🐛',  # bug
+                '\uf3ed': '📹',  # video camera
+                # Wingdings / Webdings
+                '\uf0a7': '■',  # Black square
+                '\uf0b7': '●',  # Bullet
+                '\uf0fc': '☁',  # Cloud
+                # Non-characters - remove (can't be rendered in PowerPoint XML)
+                '\uffff': '',   # Non-character, typically used as placeholder
+                '\ufffe': '',   # Non-character
+            }
+            
+            # Apply symbol mappings
+            for old_char, new_char in symbol_map.items():
+                content = content.replace(old_char, new_char)
+            
             # Remove NULL bytes and problematic control characters
             # Keep normal printable characters, whitespace, and CJK characters
-            import re
             # Remove only C0 control characters (0x00-0x1F) except tab, newline, carriage return
             content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', content)
             # Remove C1 control characters (0x80-0x9F)
             content = re.sub(r'[\x80-\x9F]', '', content)
-            # Remove Unicode non-characters (U+FDD0 - U+FDEF, U+FFFE, U+FFFF, etc.)
+            # Remove Unicode non-characters (U+FDD0 - U+FDEF, U+FFFE, U+FFFF) after mapping
             content = re.sub(r'[\uFDD0-\uFDEF\uFFFE\uFFFF]', '', content)
+            
+            # For remaining unmapped private use area characters (U+E000-U+F8FF),
+            # replace with a generic placeholder symbol (●) so content isn't lost entirely
+            # This handles custom icon fonts that we haven't mapped yet
+            def replace_pua(match):
+                # Replace each PUA character with a bullet point as a visible placeholder
+                return '●' * len(match.group(0))
+            
+            content = re.sub(r'[\uE000-\uF8FF]+', replace_pua, content)
         
         if not content or not content.strip():
             if original_content and original_content.strip():
