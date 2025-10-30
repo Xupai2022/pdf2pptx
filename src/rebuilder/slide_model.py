@@ -48,7 +48,7 @@ class SlideModel:
     def __init__(self, slide_number: int, width: float = 13.333, height: float = 7.5):
         """
         Initialize a slide model.
-        
+
         Args:
             slide_number: Slide number
             width: Slide width in inches (default 13.333 for 1920px at 144 DPI)
@@ -61,6 +61,7 @@ class SlideModel:
         self.title: Optional[str] = None
         self.background_color: Optional[str] = None
         self.background_image: Optional[bytes] = None
+        self.scale_factor: Optional[float] = None  # Store the scale factor used for this slide
     
     def add_element(self, element: SlideElement):
         """Add an element to the slide."""

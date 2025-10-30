@@ -55,30 +55,35 @@ class PPTXGenerator:
     def add_slide_from_model(self, slide_model: SlideModel) -> Any:
         """
         Add a slide to the presentation from a slide model.
-        
+
         Args:
             slide_model: SlideModel to render
-            
+
         Returns:
             Created slide object
         """
         # Use blank slide layout
         blank_layout = self.prs.slide_layouts[6]  # Blank layout
         slide = self.prs.slides.add_slide(blank_layout)
-        
+
         logger.info(f"Creating slide {slide_model.slide_number + 1} with {len(slide_model.elements)} elements")
-        
+
+        # Update style mapper with slide-specific scale factor if available
+        if hasattr(slide_model, 'scale_factor') and slide_model.scale_factor is not None:
+            self.style_mapper.update_font_scale(slide_model.scale_factor)
+            logger.info(f"Applied slide-specific scale factor: {slide_model.scale_factor:.3f}")
+
         # Set background if specified
         if slide_model.background_color:
             self._set_slide_background_color(slide, slide_model.background_color)
-        
+
         # Render elements in z-index order
         for element in slide_model.elements:
             try:
                 self.element_renderer.render_element(slide, element)
             except Exception as e:
                 logger.error(f"Failed to render element: {e}")
-        
+
         return slide
     
     def generate_from_models(self, slide_models: List[SlideModel]) -> bool:

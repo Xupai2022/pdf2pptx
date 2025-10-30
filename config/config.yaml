@@ -25,17 +25,19 @@ analyzer:
 # Coordinate Mapping Configuration
 rebuilder:
   # PowerPoint uses 72 DPI standard
-  # PDF is generated at 75% scale (1440×811 pt), need to scale back to 1920×1080 px
+  # Target slide size: 1920×1080 px (16:9 standard)
   slide_width: 26.667  # inches (1920px at 72 DPI = 1920/72 = 26.667")
   slide_height: 15.0  # inches (1080px at 72 DPI = 1080/72 = 15")
   margin_left: 0.0  # No margins to match HTML exactly
   margin_right: 0.0
   margin_top: 0.0
   margin_bottom: 0.0
-  
-  # PDF scale correction: PDF is 75% of HTML size, multiply by 1.333 to restore
-  pdf_to_html_scale: 1.333  # 4/3 ratio to convert 1440×811 → 1920×1080
-  
+
+  # PDF scale correction: NOW CALCULATED DYNAMICALLY based on PDF dimensions
+  # The system automatically calculates the appropriate scale factor
+  # for each PDF to ensure consistent visual sizing
+  pdf_to_html_scale: 1.333  # Default fallback (used only if dynamic calculation fails)
+
   # Border width correction: PDF has 5.55pt borders → 7.4pt after scaling, but HTML expects 4pt
   # Correction factor: 4pt / 7.4pt = 0.54
   border_width_correction: 0.54
@@ -44,21 +46,39 @@ rebuilder:
 mapper:
   # Font mapping (PDF font -> PPT font)
   font_mapping:
-    "SimHei": "Microsoft YaHei"
+    # Chinese fonts
+    "SimHei": "微软雅黑"
     "SimSun": "宋体"
+    "MicrosoftYaHei": "微软雅黑"
+    "MicrosoftYaHei-Bold": "微软雅黑"
+    "MicrosoftYaHeiUI": "微软雅黑"
+    "Microsoft-YaHei": "微软雅黑"
+    "KaiTi": "楷体"
+    "FangSong": "仿宋"
+
+    # Alternative mappings for UI fonts
+    "Microsoft YaHei UI": "微软雅黑"
+    "Microsoft YaHei Bold": "微软雅黑"
+
+    # Western fonts
     "Helvetica": "Arial"
+    "Helvetica-Bold": "Arial"
     "Times": "Times New Roman"
+    "Times-Bold": "Times New Roman"
     "Courier": "Courier New"
-  
+    "Arial": "Arial"
+    "Verdana": "Verdana"
+    "Tahoma": "Tahoma"
+
   default_font: "Arial"
   default_font_size: 18
   title_font_size: 32
-  
-  # Font size scaling (PDF points to HTML pixels)
-  # PDF is generated at 75% scale: 36pt in PDF = 48px in HTML
-  # Scaling factor: 1.333 (4/3) converts PDF points to match HTML pixel sizes
-  # At 72 DPI: 1 pt = 1 px, so 36pt × 1.333 = 48pt in PowerPoint = 48px equivalent
-  font_size_scale: 1.333
+
+  # Font size scaling: NOW DYNAMICALLY MATCHES coordinate scaling
+  # The system automatically adjusts font size scale to match the
+  # coordinate scaling, ensuring consistent visual appearance
+  # across PDFs of different dimensions
+  font_size_scale: 1.333  # Default fallback (will be overridden dynamically)
   
   # Color schemes
   preserve_colors: true

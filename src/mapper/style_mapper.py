@@ -47,7 +47,18 @@ class StyleMapper:
         # Count transparency mappings
         trans_count = sum(len(v) if isinstance(v, dict) else 1 for v in self.transparency_map.values())
         logger.info(f"StyleMapper initialized with font scale {self.font_size_scale}, {trans_count} transparency mappings")
-    
+
+    def update_font_scale(self, new_scale: float):
+        """
+        Update the font size scale factor.
+
+        Args:
+            new_scale: New scale factor to use
+        """
+        old_scale = self.font_size_scale
+        self.font_size_scale = new_scale
+        logger.info(f"Updated font scale: {old_scale:.3f} → {new_scale:.3f}")
+
     def apply_text_style(self, text_frame, style: Dict[str, Any]):
         """
         Apply text style to a PowerPoint text frame.

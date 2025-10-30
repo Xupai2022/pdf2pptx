@@ -15,13 +15,19 @@ class FontMapper:
     
     # Default font mapping
     DEFAULT_FONT_MAP = {
-        'SimHei': 'Microsoft YaHei',
+        # Chinese fonts
+        'SimHei': '微软雅黑',
         'SimSun': '宋体',
         'SimSun-ExtB': '宋体',
         'NSimSun': '新宋体',
         'FangSong': '仿宋',
         'KaiTi': '楷体',
-        'Microsoft-YaHei': 'Microsoft YaHei',
+        'MicrosoftYaHei': '微软雅黑',  # Use Chinese name for better PowerPoint compatibility
+        'MicrosoftYaHei-Bold': '微软雅黑',
+        'MicrosoftYaHeiUI': '微软雅黑',
+        'Microsoft-YaHei': '微软雅黑',
+
+        # Western fonts
         'Helvetica': 'Arial',
         'Helvetica-Bold': 'Arial',
         'Times': 'Times New Roman',

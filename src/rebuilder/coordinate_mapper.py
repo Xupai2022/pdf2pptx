@@ -38,26 +38,41 @@ class CoordinateMapper:
     def create_slide_model(self, layout_data: Dict[str, Any]) -> SlideModel:
         """
         Create a slide model from analyzed layout data.
-        
+
         Args:
             layout_data: Layout data from analyzer
-            
+
         Returns:
             SlideModel object
         """
         slide_num = layout_data.get('page_num', 0)
         pdf_width = layout_data.get('width', 0)
         pdf_height = layout_data.get('height', 0)
-        
+
+        # Dynamically calculate PDF to HTML scale based on actual PDF dimensions
+        if pdf_width > 0:
+            # Target width in points (72 DPI = 72 points per inch)
+            target_width_pt = self.slide_width * 72
+            # Calculate scale factor needed to match PDF to target slide width
+            dynamic_scale = target_width_pt / pdf_width
+            # Update the scale factor for this specific PDF
+            self.pdf_to_html_scale = dynamic_scale
+            logger.info(f"Dynamic scale calculation: PDF {pdf_width:.0f}pt → Target {target_width_pt:.0f}pt, scale={dynamic_scale:.3f}")
+        else:
+            logger.warning(f"Invalid PDF width: {pdf_width}, using default scale")
+            self.pdf_to_html_scale = self.config.get('pdf_to_html_scale', 1.333)
+
         slide = SlideModel(slide_num, self.slide_width, self.slide_height)
-        
+        # Store the scale factor for use by StyleMapper
+        slide.scale_factor = self.pdf_to_html_scale
+
         # Process layout regions
         for region in layout_data.get('layout', []):
             self._process_region(region, slide, pdf_width, pdf_height)
-        
+
         # Sort elements by z-index
         slide.sort_elements()
-        
+
         return slide
     
     def _process_region(self, region: Dict[str, Any], slide: SlideModel, 
