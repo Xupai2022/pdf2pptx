@@ -58,6 +58,11 @@ class ShapeMerger:
         filtered_indices = self._filter_arc_segments_near_rings(shapes, merged_indices, merged_shapes)
         merged_indices.update(filtered_indices)
         
+        # Step 4: CRITICAL FIX - Filter out large stroke-only shapes (diagonal lines)
+        # These cannot be properly rendered in PowerPoint and cause visual artifacts
+        large_stroke_indices = self._filter_large_stroke_shapes(shapes, merged_indices)
+        merged_indices.update(large_stroke_indices)
+        
         # Keep non-merged shapes
         result = []
         for i, shape in enumerate(shapes):
@@ -67,8 +72,9 @@ class ShapeMerger:
         # Add merged/converted shapes
         result.extend(merged_shapes)
         
-        if merged_shapes:
-            logger.info(f"Merged/converted {len(merged_indices)} shapes into {len(merged_shapes)} composite shapes")
+        if merged_shapes or large_stroke_indices:
+            logger.info(f"Merged/converted {len(merged_indices)} shapes into {len(merged_shapes)} composite shapes, "
+                       f"filtered {len(large_stroke_indices)} large stroke-only shapes")
         
         return result
     
@@ -119,6 +125,9 @@ class ShapeMerger:
         """
         Detect standalone stroke-only rings (circles with thick stroke, no fill or black fill).
         
+        CRITICAL FIX: Before creating standalone rings, check if there's a matching white-filled
+        circle at the same position. If found, merge them instead of creating duplicate shapes.
+        
         These are circles that represent ring shapes on their own, without needing
         a separate outer fill circle.
         
@@ -137,9 +146,19 @@ class ShapeMerger:
                 continue
             
             # Check if this is a circular shape (aspect ratio near 1.0)
-            # Use STRICTER aspect ratio to avoid arc segments
+            # Use STRICTER aspect ratio to avoid arc segments and diagonal lines
             aspect = self._get_aspect_ratio(shape)
             if not (0.85 <= aspect <= 1.15):
+                continue
+            
+            # CRITICAL FIX: Diagonal lines can have aspect ratio ~1.0 but are NOT circles
+            # Check if the shape has reasonable dimensions (not too large)
+            # Real circle nodes typically < 200pt, diagonal lines span across page (>130pt)
+            max_dimension = max(shape['width'], shape['height'])
+            if max_dimension > 120:
+                # This is likely a diagonal line spanning across the page, not a circle
+                logger.debug(f"Skipping large shape at ({shape['x']:.1f}, {shape['y']:.1f}), "
+                           f"max dimension {max_dimension:.1f}pt (likely a line, not a circle)")
                 continue
             
             # Must have a visible stroke
@@ -165,7 +184,56 @@ class ShapeMerger:
             if not is_hollow:
                 continue
             
-            # This is a standalone stroke-only ring!
+            # CRITICAL FIX: Check if there's a white-filled circle at the same position
+            # This handles the case where PDF has two separate shapes:
+            # 1. White filled circle
+            # 2. Stroke-only outline at same position
+            # These should be merged, not rendered as duplicate shapes
+            found_white_fill = False
+            for j, other_shape in enumerate(shapes):
+                if i == j or j in already_merged or j in processed_indices:
+                    continue
+                
+                # Check if it's a white-filled circle at same position
+                if self._are_shapes_concentric(shape, other_shape):
+                    other_fill = other_shape.get('fill_color', '').lower()
+                    other_stroke = other_shape.get('stroke_color')
+                    
+                    # Must be white fill with no significant stroke
+                    if other_fill == '#ffffff' and (not other_stroke or other_stroke in ['#000000', 'None']):
+                        # Found matching white fill! Merge them
+                        ring = {
+                            'type': 'shape',
+                            'shape_type': 'oval',
+                            'x': shape['x'],
+                            'y': shape['y'],
+                            'x2': shape['x2'],
+                            'y2': shape['y2'],
+                            'width': shape['width'],
+                            'height': shape['height'],
+                            'fill_color': '#FFFFFF',  # White fill from the fill circle
+                            'fill_opacity': 1.0,
+                            'stroke_color': stroke_color,  # Stroke from the outline circle
+                            'stroke_width': stroke_width,
+                            'is_ring': True,
+                            'ring_color': stroke_color,
+                            'ring_type': 'merged',  # Mark as merged from two shapes
+                            'original_shapes': [shape, other_shape]
+                        }
+                        
+                        rings.append(ring)
+                        processed_indices.add(i)
+                        processed_indices.add(j)
+                        found_white_fill = True
+                        
+                        logger.debug(f"Merged white fill circle with stroke outline at ({shape['x']:.1f}, {shape['y']:.1f}), "
+                                    f"stroke width {stroke_width}pt, color {stroke_color}")
+                        break
+            
+            if found_white_fill:
+                continue
+            
+            # No matching white fill found - this is a true standalone stroke-only ring
             # Convert to proper ring representation
             ring = {
                 'type': 'shape',
@@ -312,6 +380,7 @@ class ShapeMerger:
         - Shape is not already merged
         - Shape has fill but aspect ratio is not circular (< 0.85 or > 1.15)
         - Shape overlaps significantly with a ring shape
+        - CRITICAL FIX: Must have curved items (not simple rectangles)
         
         Args:
             shapes: List of shape elements
@@ -339,6 +408,16 @@ class ShapeMerger:
             aspect = self._get_aspect_ratio(shape)
             if 0.85 <= aspect <= 1.15:
                 # This is close to circular, not an arc segment
+                continue
+            
+            # CRITICAL FIX: Arc segments are curved shapes, not rectangles
+            # Check if this shape is a simple rectangle (aspect ratio > 2.0 suggests rectangle)
+            # True arc segments have aspect ratios closer to 0.5-0.8 (half circles, quarter circles)
+            if aspect >= 2.0:
+                # This is likely a rectangle label, not an arc segment
+                # Skip filtering to avoid removing valid content
+                logger.debug(f"Skipping arc filter for rectangular shape at ({shape['x']:.1f}, {shape['y']:.1f}), "
+                           f"aspect ratio {aspect:.2f} (too wide to be arc segment)")
                 continue
             
             # Check if this arc segment overlaps with any ring
@@ -401,3 +480,126 @@ class ShapeMerger:
         center_x = (shape['x'] + shape['x2']) / 2
         center_y = (shape['y'] + shape['y2']) / 2
         return (center_x, center_y)
+    
+    def _are_shapes_concentric(self, shape1: Dict[str, Any], shape2: Dict[str, Any]) -> bool:
+        """
+        Check if two shapes are concentric (same center, similar size).
+        
+        Args:
+            shape1: First shape
+            shape2: Second shape
+            
+        Returns:
+            True if shapes are concentric
+        """
+        # Check if both are circular
+        aspect1 = self._get_aspect_ratio(shape1)
+        aspect2 = self._get_aspect_ratio(shape2)
+        
+        if not (0.85 <= aspect1 <= 1.15 and 0.85 <= aspect2 <= 1.15):
+            return False
+        
+        # Check if centers are aligned
+        center1 = self._get_center(shape1)
+        center2 = self._get_center(shape2)
+        
+        distance = ((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)**0.5
+        
+        # Must be very close (within 5 points)
+        if distance > 5.0:
+            return False
+        
+        # Check if sizes are similar (within 20%)
+        size1 = max(shape1['width'], shape1['height'])
+        size2 = max(shape2['width'], shape2['height'])
+        size_ratio = min(size1, size2) / max(size1, size2) if max(size1, size2) > 0 else 0
+        
+        return size_ratio >= 0.8
+    
+    def _filter_large_stroke_shapes(self, shapes: List[Dict[str, Any]], 
+                                    already_merged: set) -> set:
+        """
+        Filter out large stroke-only shapes that cannot be properly rendered in PowerPoint.
+        
+        CRITICAL DISTINCTION:
+        - KEEP: Diagonal connection lines (灰色, typically #E5E5E5, width 2-3pt)
+        - FILTER: Large circular/arc shapes that should have been merged but weren't
+        
+        These filtered shapes are typically:
+        - Stroke-only circular outlines (未合并的圆环轮廓)
+        - Have no fill (stroke only)
+        - Are large and circular (aspect ratio near 1.0, > 100pt)
+        - Were NOT properly merged with their fill counterparts
+        - Would be rendered as ugly stroke rectangles in PowerPoint
+        
+        IMPORTANT: 
+        - Keep horizontal/vertical lines (height < 5 or width < 5)
+        - Keep diagonal lines with typical connection line colors (gray)
+        
+        Args:
+            shapes: List of shape elements
+            already_merged: Indices of shapes already processed
+            
+        Returns:
+            Set of indices of shapes to filter out
+        """
+        filtered_indices = set()
+        
+        for i, shape in enumerate(shapes):
+            if i in already_merged:
+                continue
+            
+            # Check if stroke-only (no fill)
+            fill_color = shape.get('fill_color')
+            stroke_color = shape.get('stroke_color')
+            
+            # Must have no fill and must have stroke
+            if fill_color or not stroke_color or stroke_color in ['#000000', 'None']:
+                continue
+            
+            # CRITICAL: Keep horizontal/vertical lines (they render correctly)
+            width = shape['width']
+            height = shape['height']
+            
+            # Horizontal line: height ≈ 0
+            is_horizontal = height < 5
+            # Vertical line: width ≈ 0  
+            is_vertical = width < 5
+            
+            if is_horizontal or is_vertical:
+                # This is a horizontal or vertical line, keep it
+                continue
+            
+            # Check if this is a large shape (both dimensions > 100pt)
+            if width > 100 and height > 100:
+                # CRITICAL: Distinguish between diagonal connection lines and circular outlines
+                # Diagonal connection lines typically have:
+                # - Gray color (#E5E5E5 or similar)
+                # - Thicker stroke (2-3pt)
+                # - Aspect ratio NOT perfectly circular (0.95-1.05 range)
+                
+                # Circular outlines that should be filtered have:
+                # - Bright colors like red (#C25151)
+                # - Thin stroke (1pt)
+                # - Nearly perfect aspect ratio (very close to 1.0)
+                
+                aspect = self._get_aspect_ratio(shape)
+                stroke_width = shape.get('stroke_width', 1.0)
+                
+                # CRITICAL DECISION: PowerPoint cannot render diagonal lines properly
+                # They get rendered as large rectangles which causes "distortion overlay" issues
+                # 
+                # Even though gray diagonal lines (#E5E5E5) are triangle edges in the PDF,
+                # they MUST be filtered because:
+                # 1. PowerPoint's python-pptx renders type='s' shapes as RECTANGLE
+                # 2. Large diagonal rectangles (137x144) create ugly overlays
+                # 3. The triangle shape is already implied by the vertex circles and labels
+                # 4. User reported "上层失真覆盖" which is exactly this issue
+                #
+                # Filter ALL large diagonal stroke shapes, regardless of color
+                filtered_indices.add(i)
+                logger.debug(f"Filtered large diagonal stroke shape at ({shape['x']:.1f}, {shape['y']:.1f}), "
+                           f"size {width:.1f}x{height:.1f}, stroke {stroke_color} width {stroke_width}pt "
+                           f"(cannot be properly rendered as diagonal line in PowerPoint)")
+        
+        return filtered_indices

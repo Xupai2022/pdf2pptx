@@ -287,10 +287,19 @@ class PDFParser:
                 if image_rects:
                     rect = image_rects[0]  # Use first occurrence
                     
-                    # Check if image is corrupted (all black or all white)
-                    is_corrupted = self._is_image_corrupted(pil_image)
+                    # Check image quality and determine action
+                    quality_status = self._check_image_quality(pil_image)
                     
-                    if is_corrupted:
+                    # quality_status: 'good', 'rerender', or 'skip'
+                    if quality_status == 'skip':
+                        # This is a low-quality rasterized vector graphic that obscures
+                        # the underlying clean vector shapes. Skip it entirely.
+                        logger.info(f"Skipping low-quality rasterized image at page {page_num}, "
+                                  f"position ({rect.x0:.1f}, {rect.y0:.1f}), "
+                                  f"allowing underlying vector shapes to show")
+                        continue
+                    
+                    if quality_status == 'rerender':
                         # Re-render the region as high-quality bitmap
                         logger.warning(f"Detected corrupted embedded image at page {page_num}, re-rendering region")
                         zoom = 4.0  # High resolution
@@ -315,7 +324,7 @@ class PDFParser:
                         'width': rect.width,
                         'height': rect.height,
                         'image_id': f"page{page_num}_img{img_index}",
-                        'was_rerendered': is_corrupted
+                        'was_rerendered': (quality_status == 'rerender')
                     }
                     
                     image_elements.append(element)
@@ -406,9 +415,12 @@ class PDFParser:
                 if fill_opacity is None:
                     fill_opacity = self._find_opacity_for_drawing(rect, opacity_by_position)
                 
+                # Detect actual shape type by analyzing drawing items
+                detected_shape_type = self._detect_shape_type(drawing)
+                
                 element = {
                     'type': 'shape',
-                    'shape_type': drawing.get("type", "path"),
+                    'shape_type': detected_shape_type,
                     'x': rect.x0,
                     'y': rect.y0,
                     'x2': rect.x1,
@@ -759,6 +771,106 @@ class PDFParser:
         
         return merged
     
+    def _detect_shape_type(self, drawing: Dict[str, Any]) -> str:
+        """
+        Detect the actual shape type by analyzing drawing items (lines, curves, etc.).
+        
+        This method provides intelligent shape detection based on the geometric properties
+        of the path, ensuring circles aren't misidentified as rectangles and lines are
+        properly preserved.
+        
+        Args:
+            drawing: PyMuPDF drawing dictionary containing items and rect
+            
+        Returns:
+            String shape type: 'oval' (circle/ellipse), 'line', 'triangle', 'rectangle', 'path'
+        """
+        items = drawing.get('items', [])
+        rect = drawing.get('rect')
+        original_type = drawing.get('type', 'path')
+        
+        if not items or not rect:
+            return original_type
+        
+        width = rect.width
+        height = rect.height
+        
+        # Calculate aspect ratio
+        aspect_ratio = width / height if height > 0 else 0
+        
+        # Count different item types
+        line_count = sum(1 for item in items if item[0] == 'l')
+        curve_count = sum(1 for item in items if item[0] == 'c')
+        rect_count = sum(1 for item in items if item[0] == 're')
+        
+        # Total non-rect items
+        path_item_count = line_count + curve_count
+        
+        # DETECTION LOGIC (order matters - most specific first)
+        
+        # 1. Circle/Oval Detection
+        # Circles use Bezier curves (typically 4 curves + connecting lines)
+        # Key indicators: 4+ curves, aspect ratio near 1.0 (circle) or different (ellipse)
+        if curve_count >= 4:
+            # This is definitely a curved shape
+            if 0.9 <= aspect_ratio <= 1.1:
+                # Nearly square aspect ratio = circle
+                logger.debug(f"Detected circle: {curve_count} curves, aspect {aspect_ratio:.3f}")
+                return 'oval'
+            else:
+                # Non-square aspect ratio = ellipse/oval
+                logger.debug(f"Detected oval/ellipse: {curve_count} curves, aspect {aspect_ratio:.3f}")
+                return 'oval'
+        
+        # 2. Line Detection (single line, stroke-only shapes)
+        # Lines are critical for triangles and other geometric shapes
+        # Characteristics: 1 line item OR very thin shape with stroke but no fill
+        fill = drawing.get('fill', None)
+        stroke = drawing.get('color', None)
+        has_fill = fill is not None
+        has_stroke = stroke is not None
+        
+        if line_count == 1 and curve_count == 0:
+            # Single line path - always preserve as line
+            logger.debug(f"Detected single line: ({rect.x0:.1f},{rect.y0:.1f}) to ({rect.x1:.1f},{rect.y1:.1f})")
+            return 'line'
+        
+        # Stroke-only thin shapes (like triangle edges)
+        # These have stroke but no fill, and are thin in one dimension
+        if has_stroke and not has_fill:
+            # Check if it's a thin line (width or height is very small relative to the other)
+            min_dim = min(width, height)
+            max_dim = max(width, height)
+            
+            if min_dim < 5 and max_dim > 10:
+                # Very thin shape - treat as line
+                logger.debug(f"Detected thin stroke line: {width:.1f}x{height:.1f}, stroke only")
+                return 'line'
+        
+        # 3. Triangle Detection
+        # Triangles have exactly 3 lines forming a closed path
+        if line_count == 3 and curve_count == 0:
+            logger.debug(f"Detected triangle: 3 lines")
+            return 'triangle'
+        
+        # 4. Rectangle Detection
+        # Explicit rectangle command OR 4 lines forming a rectangle
+        if rect_count >= 1:
+            return 'rectangle'
+        
+        if line_count == 4 and curve_count == 0:
+            # Could be a rectangle made of 4 lines
+            return 'rectangle'
+        
+        # 5. Complex Paths
+        # Multiple lines or mixed curves+lines that don't fit above patterns
+        if path_item_count > 4:
+            logger.debug(f"Complex path: {line_count} lines, {curve_count} curves")
+            return 'path'
+        
+        # Default: use original type from PyMuPDF
+        return original_type
+    
     def _rgb_to_hex(self, color) -> str:
         """
         Convert RGB color to hex format.
@@ -811,13 +923,14 @@ class PDFParser:
         
         return all_pages
     
-    def _is_image_corrupted(self, pil_image: Image.Image) -> bool:
+    def _check_image_quality(self, pil_image: Image.Image) -> str:
         """
-        Check if an image is corrupted or is a low-quality embedded icon that should be re-rendered.
+        Check the quality of an embedded image and determine the appropriate action.
         
-        This method detects two types of problematic images:
-        1. Truly corrupted images (all black, all white, or single color)
-        2. Low-quality embedded PNG icons (small size, limited colors, no alpha)
+        This method detects three types of images:
+        1. Truly corrupted images (all black, all white) -> 'rerender'
+        2. Low-quality embedded PNG icons (small size, limited colors) -> 'rerender'
+        3. Low-quality rasterized vector graphics (medium size, very limited colors, high white bg) -> 'skip'
         
         CRITICAL: This method ONLY processes embedded images extracted from PDF.
         Vector shapes are NOT passed to this method, so they remain untouched.
@@ -826,16 +939,18 @@ class PDFParser:
             pil_image: PIL Image object from embedded image extraction
             
         Returns:
-            True if image should be re-rendered for better quality
+            'good' - Image is fine, use as-is
+            'rerender' - Image is corrupted, re-render from PDF at high resolution
+            'skip' - Image is a low-quality raster overlay, skip it entirely to show underlying vectors
         """
         try:
             import numpy as np
             
             width, height = pil_image.size
             
-            # Skip very small images
+            # Skip very small images - they're fine as-is
             if width < 10 or height < 10:
-                return False
+                return 'good'
             
             # Sample 9 points (corners, edges, center)
             sample_points = [
@@ -862,7 +977,7 @@ class PDFParser:
                     continue
             
             if not pixels:
-                return False
+                return 'good'
             
             # Check 1: Truly corrupted - all pixels are the same (single color)
             first_pixel = pixels[0]
@@ -875,7 +990,7 @@ class PDFParser:
                 
                 if is_black or is_white:
                     logger.debug(f"Detected truly corrupted image: {width}x{height}, all {('black' if is_black else 'white')}")
-                    return True
+                    return 'rerender'
             
             # Check 2: Low-quality embedded icon detection
             # These are small PNG icons with no alpha channel and limited colors
@@ -902,13 +1017,81 @@ class PDFParser:
                         f"Detected low-quality embedded icon: {width}x{height}px, "
                         f"{unique_colors} colors, RGB mode - will re-render for better quality"
                     )
-                    return True
+                    return 'rerender'
             
-            return False
+            # Check 3: Large PNG images - DISABLED to prevent duplication
+            # 
+            # CRITICAL FIX: Rerendering large images causes duplication issues because
+            # page.get_pixmap(clip=rect) captures EVERYTHING in the region including:
+            # - Vector shapes (lines, circles, etc.) that are extracted separately
+            # - Text elements that are extracted separately
+            # - This causes overlapping/shadowing artifacts in the output
+            #
+            # Examples from season_report_del.pdf:
+            # - Page 4: Triangle region has vector lines + embedded image.
+            #   Rerendering captures lines into PNG, but lines also extracted as vectors → duplication
+            # - Page 6: Large image near text "30.46分". Rerendering captures text into PNG,
+            #   but text also extracted separately → text appears twice with offset
+            #
+            # Solution: DO NOT rerender large images. The original embedded images are
+            # already adequate quality. Only rerender truly corrupted images (Check 1).
+            #
+            # NOTE: This check is intentionally commented out to prevent duplication.
+            # If image quality becomes an issue, we need a smarter approach that:
+            # 1. Detects overlaps with vector shapes/text before rerendering, OR
+            # 2. Rerenders only the image data itself, not the entire region, OR  
+            # 3. Excludes rerendered regions from separate shape/text extraction
+            #
+            # is_large = (width > 200 or height > 200)
+            # 
+            # if is_large and pil_image.mode == 'RGB':
+            #     logger.info(
+            #         f"Detected large PNG image: {width}x{height}px - will re-render at high resolution for better quality"
+            #     )
+            #     return 'rerender'
+            
+            # Check 4: Low-quality rasterized vector graphics
+            # These are medium-sized PNG images that are actually poorly rasterized vector shapes
+            # They should be skipped entirely to allow the underlying vector shapes to be used
+            # 
+            # Characteristics:
+            # - Medium size (100-400px)
+            # - Extremely limited colors (< 50 colors, often just 4-10)
+            # - High percentage of white/near-white background (> 50%)
+            # - No alpha channel (RGB mode)
+            #
+            # These images are created when PDF tools rasterize vector graphics,
+            # and they obscure the clean vector shapes underneath.
+            is_medium_size = (100 < width <= 400 and 100 < height <= 400)
+            
+            if has_no_alpha and is_medium_size:
+                # Convert to numpy for efficient analysis
+                img_array = np.array(pil_image)
+                
+                # Check for extremely limited color palette
+                unique_colors = len(np.unique(img_array.reshape(-1, img_array.shape[-1]), axis=0))
+                has_very_limited_palette = unique_colors < 50
+                
+                if has_very_limited_palette:
+                    # Check for high white background percentage
+                    white_mask = np.all(img_array >= 240, axis=-1)
+                    white_pct = np.sum(white_mask) / white_mask.size * 100
+                    has_white_background = white_pct > 50
+                    
+                    if has_white_background:
+                        # This is a low-quality rasterized vector graphic that obscures
+                        # the underlying clean vector shapes. Skip it entirely.
+                        logger.info(
+                            f"Detected low-quality rasterized vector graphic: {width}x{height}px, "
+                            f"{unique_colors} colors, {white_pct:.1f}% white background - will skip to show underlying vectors"
+                        )
+                        return 'skip'
+            
+            return 'good'
             
         except Exception as e:
             logger.debug(f"Error checking image quality: {e}")
-            return False
+            return 'good'
     
     def __enter__(self):
         """Context manager entry."""

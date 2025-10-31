@@ -241,6 +241,51 @@ class ElementRenderer:
                 height = Inches(0.5)
         
         try:
+            # Special handling for lines - use connectors for proper line rendering
+            if shape_type.lower() in ['line', 'triangle']:
+                # For lines and triangles, we need to use connectors or stroke-only rectangles
+                # Check if this has stroke but no fill
+                has_stroke = style.get('stroke_color') is not None
+                has_fill = style.get('fill_color') is not None
+                
+                if shape_type.lower() == 'line' and has_stroke and not has_fill:
+                    # This is a true line - render as a connector
+                    from pptx.enum.shapes import MSO_CONNECTOR
+                    
+                    # Calculate start and end points
+                    # For horizontal lines: left to right
+                    # For vertical lines: top to bottom
+                    # For diagonal lines: top-left to bottom-right
+                    begin_x = left
+                    begin_y = top
+                    end_x = left + width
+                    end_y = top + height
+                    
+                    # Add a straight connector (line)
+                    connector = slide.shapes.add_connector(
+                        MSO_CONNECTOR.STRAIGHT,
+                        begin_x, begin_y, end_x, end_y
+                    )
+                    
+                    # Apply line style
+                    if hasattr(connector, 'line'):
+                        line = connector.line
+                        # Set line color
+                        if style.get('stroke_color'):
+                            from pptx.util import Pt
+                            from pptx.dml.color import RGBColor
+                            hex_color = style['stroke_color']
+                            if hex_color.startswith('#'):
+                                rgb = tuple(int(hex_color[i:i+2], 16) for i in (1, 3, 5))
+                                line.color.rgb = RGBColor(*rgb)
+                        
+                        # Set line width
+                        stroke_width = style.get('stroke_width', 1)
+                        line.width = Pt(stroke_width)
+                    
+                    logger.debug(f"Rendered line from ({begin_x}, {begin_y}) to ({end_x}, {end_y})")
+                    return connector
+            
             # Map shape type to MSO_SHAPE
             shape_map = {
                 'rectangle': MSO_SHAPE.RECTANGLE,
@@ -248,7 +293,8 @@ class ElementRenderer:
                 'circle': MSO_SHAPE.OVAL,
                 'oval': MSO_SHAPE.OVAL,
                 'ellipse': MSO_SHAPE.OVAL,
-                'line': MSO_SHAPE.RECTANGLE,  # Default to rectangle
+                'line': MSO_SHAPE.RECTANGLE,  # Fallback for lines with fill
+                'triangle': MSO_SHAPE.RECTANGLE,  # Triangles as rectangles for now
                 'path': MSO_SHAPE.RECTANGLE,
                 'f': MSO_SHAPE.RECTANGLE,  # Fill path - default to rectangle
                 's': MSO_SHAPE.RECTANGLE   # Stroke path - default to rectangle
