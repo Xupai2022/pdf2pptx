@@ -737,12 +737,11 @@ class PDFParser:
         Check if two shapes are overlapping duplicates (border artifacts).
         
         Shapes are considered duplicates if:
-        1. They have the same color
-        2. Their positions overlap significantly (within 2pt tolerance)
-        3. Their sizes are nearly identical (within 2pt tolerance)
-        4. They have different opacity values (one transparent, one opaque)
-        5. CRITICAL: The transparent and opaque versions must have VERY different opacity
-           (e.g., 0.03 vs 1.0, NOT 0.03 vs 0.08)
+        1. Case A (Opacity-based): They have the same color, overlapping positions, 
+           and different opacity values (one transparent, one opaque)
+        2. Case B (Stroke+Fill duplication): They have the same stroke color and overlapping positions,
+           where one is stroke-only and the other has stroke + black fill
+           (This happens when PDF renders a border with two drawing layers)
         
         Args:
             shape1: First shape element
@@ -751,31 +750,7 @@ class PDFParser:
         Returns:
             True if shapes are overlapping duplicates
         """
-        # Must have same fill color
-        if shape1['fill_color'] != shape2['fill_color']:
-            return False
-        
-        # Must have different opacity values (one transparent, one opaque)
-        opacity1 = shape1['fill_opacity']
-        opacity2 = shape2['fill_opacity']
-        
-        # Skip if both have same opacity
-        if abs(opacity1 - opacity2) < 0.001:
-            return False
-        
-        # CRITICAL FIX: One must be transparent (< 0.5) and one must be FULLY opaque (>= 0.9)
-        # This prevents merging shapes with different non-opaque transparency levels
-        # e.g., prevents merging 0.03 with 0.08, but allows merging 0.03 with 1.0
-        min_opacity = min(opacity1, opacity2)
-        max_opacity = max(opacity1, opacity2)
-        
-        has_transparent = min_opacity < 0.5
-        has_fully_opaque = max_opacity >= 0.9  # Changed from > 0.5 to >= 0.9
-        
-        if not (has_transparent and has_fully_opaque):
-            return False
-        
-        # Check position overlap (tolerance: 2pt for slight positioning differences)
+        # Check position overlap first (tolerance: 2pt for slight positioning differences)
         position_tolerance = 2.0
         x_overlap = abs(shape1['x'] - shape2['x']) <= position_tolerance
         y_overlap = abs(shape1['y'] - shape2['y']) <= position_tolerance
@@ -785,16 +760,59 @@ class PDFParser:
         width_similar = abs(shape1['width'] - shape2['width']) <= size_tolerance
         height_similar = abs(shape1['height'] - shape2['height']) <= size_tolerance
         
-        return x_overlap and y_overlap and width_similar and height_similar
+        # If positions don't overlap, not duplicates
+        if not (x_overlap and y_overlap and width_similar and height_similar):
+            return False
+        
+        # Case A: Opacity-based duplication (original logic)
+        if shape1['fill_color'] == shape2['fill_color']:
+            opacity1 = shape1['fill_opacity']
+            opacity2 = shape2['fill_opacity']
+            
+            # Must have different opacity values
+            if abs(opacity1 - opacity2) >= 0.001:
+                # CRITICAL FIX: One must be transparent (< 0.5) and one must be FULLY opaque (>= 0.9)
+                # This prevents merging shapes with different non-opaque transparency levels
+                min_opacity = min(opacity1, opacity2)
+                max_opacity = max(opacity1, opacity2)
+                
+                has_transparent = min_opacity < 0.5
+                has_fully_opaque = max_opacity >= 0.9
+                
+                if has_transparent and has_fully_opaque:
+                    return True
+        
+        # Case B: Stroke+Fill duplication
+        # Check if both have the same stroke color
+        stroke1 = shape1.get('stroke_color')
+        stroke2 = shape2.get('stroke_color')
+        
+        if stroke1 and stroke2 and stroke1 == stroke2:
+            fill1 = shape1.get('fill_color')
+            fill2 = shape2.get('fill_color')
+            
+            # Pattern: one has stroke-only (no fill or transparent fill),
+            # the other has stroke + black fill (#000000)
+            has_no_fill_1 = (not fill1 or fill1.lower() == 'none')
+            has_no_fill_2 = (not fill2 or fill2.lower() == 'none')
+            has_black_fill_1 = (fill1 and fill1.lower() == '#000000')
+            has_black_fill_2 = (fill2 and fill2.lower() == '#000000')
+            
+            # If one has no fill and the other has black fill, they're duplicates
+            if (has_no_fill_1 and has_black_fill_2) or (has_no_fill_2 and has_black_fill_1):
+                logger.debug(f"Detected stroke+fill duplication: "
+                           f"shape1 fill={fill1}, shape2 fill={fill2}, stroke={stroke1}")
+                return True
+        
+        return False
     
     def _merge_overlapping_shapes(self, shape1: Dict[str, Any], shape2: Dict[str, Any]) -> Dict[str, Any]:
         """
         Merge two overlapping shapes, keeping the best attributes.
         
         Strategy:
-        - Use the position and size from the transparent shape (more accurate)
-        - Use the transparency value from the transparent shape
-        - Remove any border (stroke) since it's an artifact
+        - For opacity-based duplicates: Use the transparent shape, remove stroke
+        - For stroke+fill duplicates: Use the stroke-only shape (cleaner rendering)
         
         Args:
             shape1: First shape element
@@ -803,6 +821,29 @@ class PDFParser:
         Returns:
             Merged shape element
         """
+        # Check if this is a stroke+fill duplication case
+        fill1 = shape1.get('fill_color')
+        fill2 = shape2.get('fill_color')
+        stroke1 = shape1.get('stroke_color')
+        stroke2 = shape2.get('stroke_color')
+        
+        has_no_fill_1 = (not fill1 or fill1.lower() == 'none')
+        has_no_fill_2 = (not fill2 or fill2.lower() == 'none')
+        has_black_fill_1 = (fill1 and fill1.lower() == '#000000')
+        has_black_fill_2 = (fill2 and fill2.lower() == '#000000')
+        
+        # If one is stroke-only and the other is stroke+black fill
+        if stroke1 and stroke2 and stroke1 == stroke2:
+            if has_no_fill_1 and has_black_fill_2:
+                # Keep stroke-only shape (shape1)
+                logger.debug(f"Merged stroke+fill duplication: keeping stroke-only shape")
+                return shape1.copy()
+            elif has_no_fill_2 and has_black_fill_1:
+                # Keep stroke-only shape (shape2)
+                logger.debug(f"Merged stroke+fill duplication: keeping stroke-only shape")
+                return shape2.copy()
+        
+        # Otherwise, use opacity-based merging (original logic)
         # Identify which shape has transparency
         if shape1['fill_opacity'] < shape2['fill_opacity']:
             transparent_shape = shape1
@@ -859,17 +900,26 @@ class PDFParser:
         
         # 1. Circle/Oval Detection
         # Circles use Bezier curves (typically 4 curves + connecting lines)
-        # Key indicators: 4+ curves, aspect ratio near 1.0 (circle) or different (ellipse)
+        # Key indicators: 4+ curves, aspect ratio near 1.0 (circle) or moderately different (ellipse)
+        # IMPORTANT: Rounded rectangles also have 4 curves (one per corner) but with extreme aspect ratios
         if curve_count >= 4:
-            # This is definitely a curved shape
+            # Check aspect ratio to distinguish between:
+            # - Circles/Ovals: aspect ratio 0.5 to 2.0 (not too extreme)
+            # - Rounded rectangles: aspect ratio < 0.5 or > 2.0 (very elongated)
+            
             if 0.9 <= aspect_ratio <= 1.1:
                 # Nearly square aspect ratio = circle
                 logger.debug(f"Detected circle: {curve_count} curves, aspect {aspect_ratio:.3f}")
                 return 'oval'
-            else:
-                # Non-square aspect ratio = ellipse/oval
+            elif 0.5 <= aspect_ratio <= 2.0:
+                # Moderate aspect ratio = ellipse/oval
                 logger.debug(f"Detected oval/ellipse: {curve_count} curves, aspect {aspect_ratio:.3f}")
                 return 'oval'
+            else:
+                # Extreme aspect ratio (< 0.5 or > 2.0) = rounded rectangle
+                # Even though it has 4 curves, the shape is clearly rectangular
+                logger.debug(f"Detected rounded rectangle: {curve_count} curves, aspect {aspect_ratio:.3f} (too extreme for oval)")
+                return 'rectangle'
         
         # 2. Line Detection (single line, stroke-only shapes)
         # Lines are critical for triangles and other geometric shapes
