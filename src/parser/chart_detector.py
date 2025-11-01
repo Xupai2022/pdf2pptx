@@ -24,8 +24,11 @@ class ChartDetector:
         """
         self.config = config
         self.min_shapes_for_chart = config.get('min_shapes_for_chart', 3)
-        self.cluster_distance_threshold = config.get('cluster_distance_threshold', 50)
-        self.min_chart_area = config.get('min_chart_area', 10000)  # pixels²
+        # 增大距离阈值，让更多相关的shapes聚成一个cluster
+        # 第14页的饼图分散较广，需要更大的阈值
+        self.cluster_distance_threshold = config.get('cluster_distance_threshold', 200)
+        # 降低最小面积要求，让小饼图也能被检测到
+        self.min_chart_area = config.get('min_chart_area', 3000)  # pixels²
         self.chart_render_dpi = config.get('chart_render_dpi', 300)
         
     def detect_chart_regions(self, page: fitz.Page, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -64,6 +67,9 @@ class ChartDetector:
                 }
                 chart_regions.append(chart_region)
                 logger.info(f"Detected chart region: bbox={bbox}, {len(cluster)} shapes")
+        
+        # Remove overlapping chart regions (keep the larger one)
+        chart_regions = self._remove_overlapping_regions(chart_regions)
         
         return chart_regions
     
@@ -196,8 +202,19 @@ class ChartDetector:
                 colors.add(fill_color)
         
         # Charts should have at least 2 distinct colors (excluding black/white)
+        # EXCEPTION: Allow single-color clusters if they have large colored shapes (likely pie chart slices)
         if len(colors) < 2:
-            return False
+            # Check if cluster contains large colored shapes (pie chart slices)
+            has_large_colored_shapes = any(
+                shape.get('fill_color') not in ['#FFFFFF', '#000000', None] and
+                shape.get('width', 0) * shape.get('height', 0) > 5000  # Large shape (>5000 pixels²)
+                for shape in cluster
+            )
+            
+            if has_large_colored_shapes:
+                logger.debug(f"Accepting single-color cluster due to large colored shapes (likely pie chart)")
+            else:
+                return False
         
         # Check if this is an overlapping cluster (stacked shapes)
         is_overlapping = self._is_overlapping_cluster(cluster)
@@ -372,6 +389,51 @@ class ChartDetector:
                 abs(y1 - y2) <= tolerance and 
                 abs(w1 - w2) <= tolerance and 
                 abs(h1 - h2) <= tolerance)
+    
+    def _remove_overlapping_regions(self, regions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Remove overlapping chart regions, keeping only the larger ones.
+        
+        Args:
+            regions: List of chart region dictionaries
+            
+        Returns:
+            Filtered list without overlapping regions
+        """
+        if len(regions) <= 1:
+            return regions
+        
+        # Sort by area (descending)
+        sorted_regions = sorted(regions, key=lambda r: 
+                               (r['bbox'][2] - r['bbox'][0]) * (r['bbox'][3] - r['bbox'][1]), 
+                               reverse=True)
+        
+        filtered = []
+        for region in sorted_regions:
+            bbox1 = region['bbox']
+            
+            # Check if this region overlaps with any already accepted region
+            overlaps = False
+            for accepted in filtered:
+                bbox2 = accepted['bbox']
+                
+                # Calculate overlap
+                overlap_x = max(0, min(bbox1[2], bbox2[2]) - max(bbox1[0], bbox2[0]))
+                overlap_y = max(0, min(bbox1[3], bbox2[3]) - max(bbox1[1], bbox2[1]))
+                overlap_area = overlap_x * overlap_y
+                
+                region_area = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+                
+                # If overlap is > 50% of this region's area, skip it
+                if overlap_area > region_area * 0.5:
+                    overlaps = True
+                    logger.info(f"Removing overlapping chart region (overlap {overlap_area:.0f}/{region_area:.0f})")
+                    break
+            
+            if not overlaps:
+                filtered.append(region)
+        
+        return filtered
     
     def render_chart_as_image(self, page: fitz.Page, bbox: Tuple[float, float, float, float]) -> bytes:
         """

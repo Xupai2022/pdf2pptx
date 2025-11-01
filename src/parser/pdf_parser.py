@@ -185,8 +185,16 @@ class PDFParser:
             page_data['elements'].append(chart_image_elem)
             
             # Mark shapes in this chart region for exclusion
-            for shape in chart_region['shapes']:
-                chart_shape_ids.add(id(shape))
+            # Include ALL shapes that are within the chart bbox, not just clustered ones
+            chart_bbox = chart_region['bbox']
+            for shape in drawing_elements:
+                # Check if shape is within chart region bbox
+                shape_center_x = (shape['x'] + shape['x2']) / 2
+                shape_center_y = (shape['y'] + shape['y2']) / 2
+                
+                if (chart_bbox[0] <= shape_center_x <= chart_bbox[2] and
+                    chart_bbox[1] <= shape_center_y <= chart_bbox[3]):
+                    chart_shape_ids.add(id(shape))
         
         # Add only non-chart shapes to elements
         for shape in drawing_elements:
