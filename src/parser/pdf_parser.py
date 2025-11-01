@@ -444,13 +444,36 @@ class PDFParser:
                 # Detect actual shape type by analyzing drawing items
                 detected_shape_type = self._detect_shape_type(drawing)
                 
+                # For single-line shapes, extract original start/end points to preserve direction
+                # This is critical for diagonal lines where direction matters (/ vs \)
+                line_start_x, line_start_y = rect.x0, rect.y0
+                line_end_x, line_end_y = rect.x1, rect.y1
+                
+                if detected_shape_type == 'line':
+                    # Extract actual line coordinates from drawing items
+                    items = drawing.get('items', [])
+                    line_items = [item for item in items if item[0] == 'l']
+                    
+                    if len(line_items) == 1:
+                        # Single line segment - use actual start and end points
+                        line_item = line_items[0]
+                        start_point = line_item[1]
+                        end_point = line_item[2]
+                        
+                        line_start_x = start_point.x
+                        line_start_y = start_point.y
+                        line_end_x = end_point.x
+                        line_end_y = end_point.y
+                        
+                        logger.debug(f"Preserved line direction: ({line_start_x:.1f},{line_start_y:.1f}) -> ({line_end_x:.1f},{line_end_y:.1f})")
+                
                 element = {
                     'type': 'shape',
                     'shape_type': detected_shape_type,
-                    'x': rect.x0,
-                    'y': rect.y0,
-                    'x2': rect.x1,
-                    'y2': rect.y1,
+                    'x': line_start_x,
+                    'y': line_start_y,
+                    'x2': line_end_x,
+                    'y2': line_end_y,
                     'width': rect.width,
                     'height': rect.height,
                     'fill_color': self._rgb_to_hex(drawing.get("fill", None)),

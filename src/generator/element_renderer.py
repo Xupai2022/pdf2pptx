@@ -253,19 +253,66 @@ class ElementRenderer:
                     from pptx.enum.shapes import MSO_CONNECTOR
                     
                     # Calculate start and end points
-                    # For horizontal lines: left to right
-                    # For vertical lines: top to bottom
-                    # For diagonal lines: top-left to bottom-right
-                    begin_x = left
-                    begin_y = top
-                    end_x = left + width
-                    end_y = top + height
+                    # Use explicit x2, y2 if available (preserves line direction / vs \)
+                    # Otherwise fall back to left+width, top+height
+                    needs_vertical_flip = False
+                    
+                    if 'x2' in position and 'y2' in position:
+                        # Use exact endpoints to preserve direction
+                        x1, y1 = position['x'], position['y']
+                        x2, y2 = position['x2'], position['y2']
+                        
+                        # Determine if line goes upward (/ direction)
+                        # PowerPoint connectors normalize to top-left start, so we need to detect
+                        # if the line should be flipped vertically to get / instead of \
+                        if y2 < y1:
+                            # Line goes upward - we need vertical flip
+                            needs_vertical_flip = True
+                            logger.debug(f"Line goes upward ({y1:.3f} -> {y2:.3f}), will apply vertical flip")
+                        
+                        begin_x = Inches(x1)
+                        begin_y = Inches(y1)
+                        end_x = Inches(x2)
+                        end_y = Inches(y2)
+                        logger.debug(f"Using explicit endpoints: ({x1:.3f},{y1:.3f}) -> ({x2:.3f},{y2:.3f})")
+                    else:
+                        # Fallback to bounding box (legacy behavior)
+                        begin_x = left
+                        begin_y = top
+                        end_x = left + width
+                        end_y = top + height
+                        logger.debug(f"Using bounding box for line endpoints")
                     
                     # Add a straight connector (line)
+                    # Note: PowerPoint will normalize this to left-top start point
                     connector = slide.shapes.add_connector(
                         MSO_CONNECTOR.STRAIGHT,
                         begin_x, begin_y, end_x, end_y
                     )
+                    
+                    # Apply vertical flip if needed to preserve / direction
+                    if needs_vertical_flip:
+                        try:
+                            # Access the shape's XML element
+                            sp_element = connector._element
+                            # Look for spPr (shape properties) element
+                            spPr = sp_element.find('.//{http://schemas.openxmlformats.org/presentationml/2006/main}spPr')
+                            if spPr is None:
+                                spPr = sp_element.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}spPr')
+                            
+                            if spPr is not None:
+                                # Look for xfrm (transform) element
+                                xfrm = spPr.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm')
+                                if xfrm is not None:
+                                    # Set flipV attribute to true (1)
+                                    xfrm.set('flipV', '1')
+                                    logger.debug(f"Applied vertical flip to connector via XML")
+                                else:
+                                    logger.warning("Could not find xfrm element for vertical flip")
+                            else:
+                                logger.warning("Could not find spPr element for vertical flip")
+                        except Exception as e:
+                            logger.warning(f"Failed to apply vertical flip: {e}")
                     
                     # Apply line style
                     if hasattr(connector, 'line'):

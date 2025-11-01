@@ -142,6 +142,9 @@ class CoordinateMapper:
                     if is_border:
                         logger.debug(f"Found border shape: {elem_width:.2f} × {elem_height:.2f} pt, role={role}")
                     
+                    # For lines, preserve endpoint coordinates to maintain direction (/ vs \)
+                    is_line = shape_type == 'line'
+                    
                     style = {
                         'fill_color': elem.get('fill_color'),
                         'fill_opacity': elem.get('fill_opacity', 1.0),
@@ -155,7 +158,8 @@ class CoordinateMapper:
                     shape_position = self._pdf_to_slide_coords(
                         [elem['x'], elem['y'], elem['x2'], elem['y2']],
                         pdf_width, pdf_height,
-                        apply_border_correction=is_border
+                        apply_border_correction=is_border,
+                        preserve_endpoints=is_line
                     )
                     slide.add_shape(shape_type, shape_position, style, z_index)
         
@@ -166,7 +170,8 @@ class CoordinateMapper:
                     slide.set_background(color=elem.get('fill_color'))
     
     def _pdf_to_slide_coords(self, bbox: list, pdf_width: float, 
-                            pdf_height: float, apply_border_correction: bool = False) -> Dict[str, float]:
+                            pdf_height: float, apply_border_correction: bool = False,
+                            preserve_endpoints: bool = False) -> Dict[str, float]:
         """
         Convert PDF coordinates to slide coordinates.
         
@@ -175,6 +180,7 @@ class CoordinateMapper:
             pdf_width: PDF page width
             pdf_height: PDF page height
             apply_border_correction: Apply border width correction for thin shapes
+            preserve_endpoints: If True, also include x2,y2 in result (for lines)
             
         Returns:
             Position dictionary with normalized coordinates
@@ -212,18 +218,21 @@ class CoordinateMapper:
         scaled_pdf_height = pdf_height * self.pdf_to_html_scale
         
         # Normalize to 0-1 range (using scaled dimensions)
-        norm_x = x1 / scaled_pdf_width if scaled_pdf_width > 0 else 0
-        norm_y = y1 / scaled_pdf_height if scaled_pdf_height > 0 else 0
-        norm_w = (x2 - x1) / scaled_pdf_width if scaled_pdf_width > 0 else 0
-        norm_h = (y2 - y1) / scaled_pdf_height if scaled_pdf_height > 0 else 0
+        norm_x1 = x1 / scaled_pdf_width if scaled_pdf_width > 0 else 0
+        norm_y1 = y1 / scaled_pdf_height if scaled_pdf_height > 0 else 0
+        norm_x2 = x2 / scaled_pdf_width if scaled_pdf_width > 0 else 0
+        norm_y2 = y2 / scaled_pdf_height if scaled_pdf_height > 0 else 0
+        
+        norm_w = norm_x2 - norm_x1
+        norm_h = norm_y2 - norm_y1
         
         # Apply margins
         content_width = self.slide_width - self.margin_left - self.margin_right
         content_height = self.slide_height - self.margin_top - self.margin_bottom
         
         # Convert to inches
-        x = self.margin_left + norm_x * content_width
-        y = self.margin_top + norm_y * content_height
+        x = self.margin_left + norm_x1 * content_width
+        y = self.margin_top + norm_y1 * content_height
         width = norm_w * content_width
         height = norm_h * content_height
         
@@ -231,12 +240,21 @@ class CoordinateMapper:
             logger.debug(f"  Final position (inches): x={x:.4f}, y={y:.4f}, width={width:.4f}, height={height:.4f}")
             logger.debug(f"  In points: width={width*72:.2f}pt, height={height*72:.2f}pt")
         
-        return {
+        result = {
             'x': x,
             'y': y,
             'width': width,
             'height': height
         }
+        
+        # For lines, also include endpoint coordinates to preserve direction
+        if preserve_endpoints:
+            x2_inches = self.margin_left + norm_x2 * content_width
+            y2_inches = self.margin_top + norm_y2 * content_height
+            result['x2'] = x2_inches
+            result['y2'] = y2_inches
+        
+        return result
     
     def _extract_text_style(self, elements: list) -> Dict[str, Any]:
         """
