@@ -521,9 +521,12 @@ class ShapeMerger:
         """
         Filter out large stroke-only shapes that cannot be properly rendered in PowerPoint.
         
-        CRITICAL DISTINCTION:
-        - KEEP: Diagonal connection lines (灰色, typically #E5E5E5, width 2-3pt)
-        - FILTER: Large circular/arc shapes that should have been merged but weren't
+        CRITICAL FIX: This method previously filtered ALL large diagonal lines, but that was
+        incorrect. PowerPoint CAN properly render diagonal lines using connectors (MSO_CONNECTOR.STRAIGHT).
+        
+        CORRECTED DISTINCTION:
+        - KEEP: Diagonal lines (shape_type=='line', stroke-only, any size) → rendered as connectors
+        - FILTER: Large circular outlines that should have been merged but weren't
         
         These filtered shapes are typically:
         - Stroke-only circular outlines (未合并的圆环轮廓)
@@ -531,10 +534,6 @@ class ShapeMerger:
         - Are large and circular (aspect ratio near 1.0, > 100pt)
         - Were NOT properly merged with their fill counterparts
         - Would be rendered as ugly stroke rectangles in PowerPoint
-        
-        IMPORTANT: 
-        - Keep horizontal/vertical lines (height < 5 or width < 5)
-        - Keep diagonal lines with typical connection line colors (gray)
         
         Args:
             shapes: List of shape elements
@@ -547,6 +546,14 @@ class ShapeMerger:
         
         for i, shape in enumerate(shapes):
             if i in already_merged:
+                continue
+            
+            # CRITICAL: Check if this is a 'line' shape type
+            # Lines are properly rendered as connectors by element_renderer, so NEVER filter them
+            shape_type = shape.get('shape_type', '')
+            if shape_type.lower() == 'line':
+                # This is a line shape - it will be rendered as a connector
+                # Never filter lines, regardless of size or orientation
                 continue
             
             # Check if stroke-only (no fill)
@@ -572,34 +579,18 @@ class ShapeMerger:
             
             # Check if this is a large shape (both dimensions > 100pt)
             if width > 100 and height > 100:
-                # CRITICAL: Distinguish between diagonal connection lines and circular outlines
-                # Diagonal connection lines typically have:
-                # - Gray color (#E5E5E5 or similar)
-                # - Thicker stroke (2-3pt)
-                # - Aspect ratio NOT perfectly circular (0.95-1.05 range)
-                
-                # Circular outlines that should be filtered have:
-                # - Bright colors like red (#C25151)
-                # - Thin stroke (1pt)
-                # - Nearly perfect aspect ratio (very close to 1.0)
-                
+                # Filter large stroke-only shapes that are NOT lines
+                # These are typically circular outlines that should have been merged
                 aspect = self._get_aspect_ratio(shape)
                 stroke_width = shape.get('stroke_width', 1.0)
                 
-                # CRITICAL DECISION: PowerPoint cannot render diagonal lines properly
-                # They get rendered as large rectangles which causes "distortion overlay" issues
-                # 
-                # Even though gray diagonal lines (#E5E5E5) are triangle edges in the PDF,
-                # they MUST be filtered because:
-                # 1. PowerPoint's python-pptx renders type='s' shapes as RECTANGLE
-                # 2. Large diagonal rectangles (137x144) create ugly overlays
-                # 3. The triangle shape is already implied by the vertex circles and labels
-                # 4. User reported "上层失真覆盖" which is exactly this issue
-                #
-                # Filter ALL large diagonal stroke shapes, regardless of color
-                filtered_indices.add(i)
-                logger.debug(f"Filtered large diagonal stroke shape at ({shape['x']:.1f}, {shape['y']:.1f}), "
-                           f"size {width:.1f}x{height:.1f}, stroke {stroke_color} width {stroke_width}pt "
-                           f"(cannot be properly rendered as diagonal line in PowerPoint)")
+                # Only filter if aspect ratio is near circular (0.8-1.2)
+                # This ensures we don't filter elongated shapes that might be valid
+                if 0.8 <= aspect <= 1.2:
+                    filtered_indices.add(i)
+                    logger.debug(f"Filtered large circular stroke shape at ({shape['x']:.1f}, {shape['y']:.1f}), "
+                               f"size {width:.1f}x{height:.1f}, aspect {aspect:.2f}, "
+                               f"stroke {stroke_color} width {stroke_width}pt "
+                               f"(unmerged circular outline)")
         
         return filtered_indices

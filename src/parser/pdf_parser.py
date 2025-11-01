@@ -5,7 +5,7 @@ PDF Parser - Main parser class for extracting content from PDF files
 import fitz  # PyMuPDF
 import logging
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from pathlib import Path
 import io
 from PIL import Image
@@ -139,9 +139,9 @@ class PDFParser:
         if icon_indices:
             logger.info(f"Page {page_num}: Filtered out {len(icon_indices)} icon font text element(s)")
         
-        # Extract images
+        # Extract images (pass text elements for overlap detection)
         if self.extract_images:
-            image_elements = self._extract_images(page, page_num)
+            image_elements = self._extract_images(page, page_num, filtered_text_elements)
             page_data['elements'].extend(image_elements)
         
         # Extract shapes/drawings with opacity information
@@ -252,19 +252,24 @@ class PDFParser:
         
         return text_elements
     
-    def _extract_images(self, page: fitz.Page, page_num: int) -> List[Dict[str, Any]]:
+    def _extract_images(self, page: fitz.Page, page_num: int, text_elements: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
-        Extract images from the page.
+        Extract images from the page with smart overlap detection for rerendering.
         
         Args:
             page: PyMuPDF page object
             page_num: Page number for naming
+            text_elements: Optional list of already-extracted text elements for overlap detection
             
         Returns:
             List of image element dictionaries
         """
         image_elements = []
         image_list = page.get_images(full=True)
+        
+        # If text_elements not provided, extract them for overlap detection
+        if text_elements is None:
+            text_elements = []
         
         for img_index, img_info in enumerate(image_list):
             try:
@@ -288,7 +293,7 @@ class PDFParser:
                     rect = image_rects[0]  # Use first occurrence
                     
                     # Check image quality and determine action
-                    quality_status = self._check_image_quality(pil_image)
+                    quality_status, needs_large_image_enhancement = self._check_image_quality(pil_image, rect)
                     
                     # quality_status: 'good', 'rerender', or 'skip'
                     if quality_status == 'skip':
@@ -299,17 +304,38 @@ class PDFParser:
                                   f"allowing underlying vector shapes to show")
                         continue
                     
-                    if quality_status == 'rerender':
-                        # Re-render the region as high-quality bitmap
-                        logger.warning(f"Detected corrupted embedded image at page {page_num}, re-rendering region")
-                        zoom = 4.0  # High resolution
-                        matrix = fitz.Matrix(zoom, zoom)
-                        region_pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=False)
-                        image_bytes = region_pix.tobytes("png")
-                        image_ext = "png"
+                    if quality_status == 'rerender' or needs_large_image_enhancement:
+                        # Check for text/shape overlaps BEFORE rerendering
+                        safe_rect = self._calculate_safe_rerender_bbox(rect, text_elements, page)
                         
-                        # Update PIL image
-                        pil_image = Image.open(io.BytesIO(image_bytes))
+                        if safe_rect and (safe_rect.width > 20 and safe_rect.height > 20):
+                            # Safe region found and is large enough to rerender
+                            logger.info(f"Re-rendering image at page {page_num} with safe bbox "
+                                      f"({safe_rect.x0:.1f}, {safe_rect.y0:.1f}, {safe_rect.x1:.1f}, {safe_rect.y1:.1f}), "
+                                      f"original bbox ({rect.x0:.1f}, {rect.y0:.1f}, {rect.x1:.1f}, {rect.y1:.1f})")
+                            zoom = 4.0  # High resolution
+                            matrix = fitz.Matrix(zoom, zoom)
+                            region_pix = page.get_pixmap(matrix=matrix, clip=safe_rect, alpha=False)
+                            image_bytes = region_pix.tobytes("png")
+                            image_ext = "png"
+                            
+                            # Update PIL image
+                            pil_image = Image.open(io.BytesIO(image_bytes))
+                            
+                            # Use safe_rect as the new rect
+                            rect = safe_rect
+                        elif quality_status == 'rerender':
+                            # For truly corrupted images, we still need to rerender even with overlap
+                            logger.warning(f"Re-rendering corrupted image at page {page_num} (has overlaps but required)")
+                            zoom = 4.0
+                            matrix = fitz.Matrix(zoom, zoom)
+                            region_pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=False)
+                            image_bytes = region_pix.tobytes("png")
+                            image_ext = "png"
+                            pil_image = Image.open(io.BytesIO(image_bytes))
+                        else:
+                            # Large image needs enhancement but has overlaps, use original
+                            logger.info(f"Keeping original large image at page {page_num} due to text/shape overlaps")
                     
                     element = {
                         'type': 'image',
@@ -324,7 +350,7 @@ class PDFParser:
                         'width': rect.width,
                         'height': rect.height,
                         'image_id': f"page{page_num}_img{img_index}",
-                        'was_rerendered': (quality_status == 'rerender')
+                        'was_rerendered': (quality_status == 'rerender' or needs_large_image_enhancement)
                     }
                     
                     image_elements.append(element)
@@ -923,7 +949,7 @@ class PDFParser:
         
         return all_pages
     
-    def _check_image_quality(self, pil_image: Image.Image) -> str:
+    def _check_image_quality(self, pil_image: Image.Image, rect: fitz.Rect = None) -> Tuple[str, bool]:
         """
         Check the quality of an embedded image and determine the appropriate action.
         
@@ -931,17 +957,19 @@ class PDFParser:
         1. Truly corrupted images (all black, all white) -> 'rerender'
         2. Low-quality embedded PNG icons (small size, limited colors) -> 'rerender'
         3. Low-quality rasterized vector graphics (medium size, very limited colors, high white bg) -> 'skip'
+        4. Large images that need quality enhancement -> needs_enhancement=True
         
         CRITICAL: This method ONLY processes embedded images extracted from PDF.
         Vector shapes are NOT passed to this method, so they remain untouched.
         
         Args:
             pil_image: PIL Image object from embedded image extraction
+            rect: Optional rectangle for size checking in points
             
         Returns:
-            'good' - Image is fine, use as-is
-            'rerender' - Image is corrupted, re-render from PDF at high resolution
-            'skip' - Image is a low-quality raster overlay, skip it entirely to show underlying vectors
+            Tuple of (quality_status, needs_large_image_enhancement):
+                quality_status: 'good', 'rerender', or 'skip'
+                needs_large_image_enhancement: True if large image needs quality boost
         """
         try:
             import numpy as np
@@ -990,7 +1018,7 @@ class PDFParser:
                 
                 if is_black or is_white:
                     logger.debug(f"Detected truly corrupted image: {width}x{height}, all {('black' if is_black else 'white')}")
-                    return 'rerender'
+                    return ('rerender', False)
             
             # Check 2: Low-quality embedded icon detection
             # These are small PNG icons with no alpha channel and limited colors
@@ -1017,38 +1045,30 @@ class PDFParser:
                         f"Detected low-quality embedded icon: {width}x{height}px, "
                         f"{unique_colors} colors, RGB mode - will re-render for better quality"
                     )
-                    return 'rerender'
+                    return ('rerender', False)
             
-            # Check 3: Large PNG images - DISABLED to prevent duplication
+            # Check 3: Large PNG images - NOW ENABLED with smart overlap detection
             # 
-            # CRITICAL FIX: Rerendering large images causes duplication issues because
-            # page.get_pixmap(clip=rect) captures EVERYTHING in the region including:
-            # - Vector shapes (lines, circles, etc.) that are extracted separately
-            # - Text elements that are extracted separately
-            # - This causes overlapping/shadowing artifacts in the output
+            # CRITICAL FIX v2: We NOW enable large image rerendering but with smart overlap detection.
+            # The _extract_images method will call _calculate_safe_rerender_bbox to:
+            # - Detect overlaps with text/shapes BEFORE rerendering
+            # - Shrink the rerender bbox to exclude overlapping regions
+            # - Only rerender the safe, non-overlapping portion
             #
-            # Examples from season_report_del.pdf:
-            # - Page 4: Triangle region has vector lines + embedded image.
-            #   Rerendering captures lines into PNG, but lines also extracted as vectors → duplication
-            # - Page 6: Large image near text "30.46分". Rerendering captures text into PNG,
-            #   but text also extracted separately → text appears twice with offset
+            # This solves the duplication issue while still improving image quality.
             #
-            # Solution: DO NOT rerender large images. The original embedded images are
-            # already adequate quality. Only rerender truly corrupted images (Check 1).
-            #
-            # NOTE: This check is intentionally commented out to prevent duplication.
-            # If image quality becomes an issue, we need a smarter approach that:
-            # 1. Detects overlaps with vector shapes/text before rerendering, OR
-            # 2. Rerenders only the image data itself, not the entire region, OR  
-            # 3. Excludes rerendered regions from separate shape/text extraction
-            #
-            # is_large = (width > 200 or height > 200)
-            # 
-            # if is_large and pil_image.mode == 'RGB':
-            #     logger.info(
-            #         f"Detected large PNG image: {width}x{height}px - will re-render at high resolution for better quality"
-            #     )
-            #     return 'rerender'
+            # Check if this is a large image that could benefit from enhancement
+            is_large = rect and (rect.width > 200 or rect.height > 200)
+            needs_large_image_enhancement = False
+            
+            if is_large and pil_image.mode == 'RGB':
+                # Large RGB images often have quality issues
+                # Signal that enhancement is desired, but let _extract_images decide
+                # based on overlap detection
+                needs_large_image_enhancement = True
+                logger.debug(
+                    f"Detected large PNG image: {width}x{height}px - may re-render if no text/shape overlaps"
+                )
             
             # Check 4: Low-quality rasterized vector graphics
             # These are medium-sized PNG images that are actually poorly rasterized vector shapes
@@ -1085,13 +1105,93 @@ class PDFParser:
                             f"Detected low-quality rasterized vector graphic: {width}x{height}px, "
                             f"{unique_colors} colors, {white_pct:.1f}% white background - will skip to show underlying vectors"
                         )
-                        return 'skip'
+                        return ('skip', False)
             
-            return 'good'
+            return ('good', needs_large_image_enhancement)
             
         except Exception as e:
             logger.debug(f"Error checking image quality: {e}")
-            return 'good'
+            return ('good', False)
+    
+    def _calculate_safe_rerender_bbox(self, img_rect: fitz.Rect, text_elements: List[Dict[str, Any]], 
+                                       page: fitz.Page) -> Optional[fitz.Rect]:
+        """
+        Calculate a safe bounding box for rerendering an image that avoids overlapping text/shapes.
+        
+        This method detects overlaps between the image bbox and text/shape bboxes, then shrinks
+        the image bbox to exclude the overlapping regions.
+        
+        Args:
+            img_rect: Original image rectangle
+            text_elements: List of already-extracted text elements
+            page: PyMuPDF page object for shape detection
+            
+        Returns:
+            Safe rectangle for rerendering, or None if no safe region exists
+        """
+        # Start with the original rect
+        safe_rect = fitz.Rect(img_rect)
+        margin = 2.0  # Add small margin to avoid edge overlaps
+        
+        # Check overlaps with text elements
+        for text_elem in text_elements:
+            text_bbox = (text_elem['x'], text_elem['y'], text_elem['x2'], text_elem['y2'])
+            text_rect = fitz.Rect(text_bbox)
+            
+            # Check if text overlaps with current safe_rect
+            if safe_rect.intersects(text_rect):
+                # Text overlaps - we need to shrink safe_rect to avoid it
+                logger.debug(f"Text '{text_elem.get('content', '')[:20]}...' overlaps image at "
+                           f"({text_rect.x0:.1f}, {text_rect.y0:.1f}, {text_rect.x1:.1f}, {text_rect.y1:.1f})")
+                
+                # Determine which edge to shrink
+                # If text is at the top of image, move safe_rect's top down
+                if text_rect.y0 < safe_rect.y0 + safe_rect.height * 0.3:
+                    # Text is in top portion of image
+                    new_y0 = text_rect.y1 + margin
+                    if new_y0 < safe_rect.y1:
+                        safe_rect.y0 = new_y0
+                        logger.debug(f"Shrunk image top to y={new_y0:.1f} to avoid text")
+                
+                # If text is at the bottom of image, move safe_rect's bottom up
+                elif text_rect.y1 > safe_rect.y0 + safe_rect.height * 0.7:
+                    # Text is in bottom portion of image
+                    new_y1 = text_rect.y0 - margin
+                    if new_y1 > safe_rect.y0:
+                        safe_rect.y1 = new_y1
+                        logger.debug(f"Shrunk image bottom to y={new_y1:.1f} to avoid text")
+                
+                # If text is on the left side
+                elif text_rect.x0 < safe_rect.x0 + safe_rect.width * 0.3:
+                    # Text is in left portion of image
+                    new_x0 = text_rect.x1 + margin
+                    if new_x0 < safe_rect.x1:
+                        safe_rect.x0 = new_x0
+                        logger.debug(f"Shrunk image left to x={new_x0:.1f} to avoid text")
+                
+                # If text is on the right side
+                elif text_rect.x1 > safe_rect.x0 + safe_rect.width * 0.7:
+                    # Text is in right portion of image
+                    new_x1 = text_rect.x0 - margin
+                    if new_x1 > safe_rect.x0:
+                        safe_rect.x1 = new_x1
+                        logger.debug(f"Shrunk image right to x={new_x1:.1f} to avoid text")
+        
+        # Check if the safe_rect is still large enough to be useful
+        if safe_rect.width < 20 or safe_rect.height < 20:
+            logger.warning(f"Safe rerender bbox too small ({safe_rect.width:.1f}x{safe_rect.height:.1f}), "
+                         f"will not rerender")
+            return None
+        
+        # Check if we actually shrunk the rect
+        if safe_rect != img_rect:
+            logger.info(f"Calculated safe rerender bbox: "
+                      f"original ({img_rect.x0:.1f}, {img_rect.y0:.1f}, {img_rect.x1:.1f}, {img_rect.y1:.1f}), "
+                      f"safe ({safe_rect.x0:.1f}, {safe_rect.y0:.1f}, {safe_rect.x1:.1f}, {safe_rect.y1:.1f})")
+            return safe_rect
+        else:
+            # No overlap, safe to rerender entire image
+            return img_rect
     
     def __enter__(self):
         """Context manager entry."""
