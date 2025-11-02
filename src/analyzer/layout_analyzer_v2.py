@@ -367,6 +367,23 @@ class LayoutAnalyzerV2:
                         # Case 2: Bracket-related elements (forming "(text)" group)
                         # These should merge with moderate distance (< 50pt)
                         elif has_bracket:
+                            # For -45° rotated text, use diagonal position to check if on same line
+                            # Elements on the same diagonal line have similar (x + y) values
+                            elem_x_center = (elem_x + elem_x2) / 2
+                            elem_y_center = (elem_y + elem_y2) / 2
+                            other_x_center = (other_x + other_x2) / 2
+                            other_y_center = (other_y + other_y2) / 2
+                            
+                            elem_diagonal = elem_x_center + elem_y_center
+                            other_diagonal = other_x_center + other_y_center
+                            diagonal_diff = abs(elem_diagonal - other_diagonal)
+                            
+                            # If diagonal position differs by > 20pt, they're on different lines
+                            if diagonal_diff > 20:
+                                logger.debug(f"Not merging rotated text '{elem_text}' + '{other_text}' "
+                                           f"(diagonal差异={diagonal_diff:.2f}pt > 20pt, different diagonal lines)")
+                                continue
+                            
                             if distance < 50 and abs(other_font_size - elem_font_size) <= 2:
                                 should_group = True
                                 merge_reason = "bracket group elements"
@@ -376,7 +393,7 @@ class LayoutAnalyzerV2:
                                 current_x2 = max(current_x2, other_x2)
                                 
                                 logger.debug(f"Merging rotated text '{elem_text}' + '{other_text}' "
-                                           f"(distance={distance:.2f}pt, rotation={elem_rotation:.1f}°, reason={merge_reason})")
+                                           f"(distance={distance:.2f}pt, diagonal差异={diagonal_diff:.2f}pt, rotation={elem_rotation:.1f}°, reason={merge_reason})")
                                 continue
                 
                 # Group if on same line and close horizontal proximity

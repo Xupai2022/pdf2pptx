@@ -256,24 +256,63 @@ class PDFParser:
                         while rotation_angle < -180:
                             rotation_angle += 360
                         
-                        element = {
-                            'type': 'text',
-                            'content': text,
-                            'x': bbox[0],
-                            'y': bbox[1],
-                            'x2': bbox[2],
-                            'y2': bbox[3],
-                            'width': bbox[2] - bbox[0],
-                            'height': bbox[3] - bbox[1],
-                            'font_name': span.get("font", ""),
-                            'font_size': font_size,
-                            'color': self._rgb_to_hex(span.get("color", 0)),
-                            'flags': span.get("flags", 0),  # bold, italic, etc.
-                            'is_bold': bool(span.get("flags", 0) & 2**4),
-                            'is_italic': bool(span.get("flags", 0) & 2**1),
-                            'rotation': rotation_angle,  # Add rotation angle in degrees
-                            'text_dir': line_dir  # Store original direction vector for reference
-                        }
+                        # For rotated text, we need special handling of position
+                        # The bbox is the rotated bounding rectangle, but for positioning in PowerPoint,
+                        # we need to use the text baseline position (origin) and calculate correct dimensions
+                        origin = span.get("origin", (bbox[0], bbox[1]))
+                        
+                        # Check if text is significantly rotated (more than 5 degrees)
+                        is_rotated = abs(rotation_angle) > 5
+                        
+                        if is_rotated:
+                            # For rotated text, use bbox as the physical boundaries
+                            # but store origin for future reference if needed
+                            # The key insight: bbox is already correct for the rotated text rectangle
+                            # We just need to ensure we don't try to "correct" it
+                            
+                            # Use bbox as-is for rotated text
+                            # This preserves the actual rendered position in PDF
+                            element = {
+                                'type': 'text',
+                                'content': text,
+                                'x': bbox[0],
+                                'y': bbox[1],
+                                'x2': bbox[2],
+                                'y2': bbox[3],
+                                'width': bbox[2] - bbox[0],
+                                'height': bbox[3] - bbox[1],
+                                'font_name': span.get("font", ""),
+                                'font_size': font_size,
+                                'color': self._rgb_to_hex(span.get("color", 0)),
+                                'flags': span.get("flags", 0),
+                                'is_bold': bool(span.get("flags", 0) & 2**4),
+                                'is_italic': bool(span.get("flags", 0) & 2**1),
+                                'rotation': rotation_angle,
+                                'text_dir': line_dir,
+                                'origin': origin,  # Store origin for reference
+                                'is_rotated': True
+                            }
+                        else:
+                            # For non-rotated text, use bbox as usual
+                            element = {
+                                'type': 'text',
+                                'content': text,
+                                'x': bbox[0],
+                                'y': bbox[1],
+                                'x2': bbox[2],
+                                'y2': bbox[3],
+                                'width': bbox[2] - bbox[0],
+                                'height': bbox[3] - bbox[1],
+                                'font_name': span.get("font", ""),
+                                'font_size': font_size,
+                                'color': self._rgb_to_hex(span.get("color", 0)),
+                                'flags': span.get("flags", 0),
+                                'is_bold': bool(span.get("flags", 0) & 2**4),
+                                'is_italic': bool(span.get("flags", 0) & 2**1),
+                                'rotation': rotation_angle,
+                                'text_dir': line_dir,
+                                'is_rotated': False
+                            }
                         
                         text_elements.append(element)
         

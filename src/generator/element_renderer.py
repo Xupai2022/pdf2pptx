@@ -122,22 +122,35 @@ class ElementRenderer:
         width = Inches(position['width'])
         height = Inches(position['height'])
         
-        # Calculate estimated text width to prevent wrapping
-        # Average character width is roughly 0.6 of font size
-        font_size = style.get('font_size', 18)
-        char_count = len(content.strip())
-        # Estimate required width in points (1 inch = 72 points)
-        estimated_width_pt = char_count * font_size * 0.6
-        estimated_width_inches = estimated_width_pt / 72.0
+        # Check if this is rotated text
+        rotation = style.get('rotation', 0)
+        is_rotated = abs(rotation) > 5
         
-        # Use larger of provided width or estimated width (with 20% padding)
-        min_width = max(Inches(0.3), estimated_width_inches * 1.2)
-        if width < min_width:
-            width = min_width
-        
-        # Ensure minimum height
-        if height < Inches(0.15):
-            height = Inches(0.2)
+        if not is_rotated:
+            # Only adjust dimensions for non-rotated text
+            # For rotated text, the bbox from PDF is already correct and should not be modified
+            
+            # Calculate estimated text width to prevent wrapping
+            # Average character width is roughly 0.6 of font size
+            font_size = style.get('font_size', 18)
+            char_count = len(content.strip())
+            # Estimate required width in points (1 inch = 72 points)
+            estimated_width_pt = char_count * font_size * 0.6
+            estimated_width_inches = estimated_width_pt / 72.0
+            
+            # Use larger of provided width or estimated width (with 20% padding)
+            min_width = max(Inches(0.3), estimated_width_inches * 1.2)
+            if width < min_width:
+                width = min_width
+            
+            # Ensure minimum height
+            if height < Inches(0.15):
+                height = Inches(0.2)
+        else:
+            # For rotated text, keep bbox dimensions exactly as provided by PDF
+            # The PDF bbox already accounts for rotation
+            # Modifying width/height will shift the rotated text position incorrectly
+            pass
         
         try:
             textbox = slide.shapes.add_textbox(left, top, width, height)
