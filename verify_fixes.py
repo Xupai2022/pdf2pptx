@@ -1,169 +1,186 @@
 #!/usr/bin/env python3
 """
-Verify that all three issues have been fixed in the conversion
+验证修复效果
 """
 
-import fitz
-import sys
-from pathlib import Path
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
+import logging
 
-def verify_circles_on_page_2(pdf_path):
-    """Verify circles are properly detected on page 2"""
-    print("\n" + "="*80)
-    print("VERIFICATION 1: Page 2 - Circle Detection")
-    print("="*80)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def verify_page15_rotation(pptx_path):
+    """验证第15页文字旋转"""
+    prs = Presentation(pptx_path)
+    slide = prs.slides[14]  # Page 15 (0-indexed)
     
-    doc = fitz.open(pdf_path)
-    page = doc[1]  # Page 2 (0-indexed)
+    logger.info("=" * 80)
+    logger.info("验证第15页：X轴标签旋转")
+    logger.info("=" * 80)
     
-    # Import parser to test shape detection
-    sys.path.insert(0, str(Path.cwd()))
-    from src.parser.pdf_parser import PDFParser
+    rotated_texts = []
+    for shape in slide.shapes:
+        if shape.has_text_frame and shape.text:
+            # 检查是否包含X轴标签文本
+            text = shape.text
+            if "10.74" in text or "xos-" in text:
+                rotation = shape.rotation if hasattr(shape, 'rotation') else 0
+                rotated_texts.append({
+                    'text': text[:30],
+                    'rotation': rotation
+                })
+                logger.info(f"文本: '{text[:30]}...'")
+                logger.info(f"  旋转角度: {rotation}°")
     
-    config = {'dpi': 300, 'extract_images': True}
-    parser = PDFParser(config)
+    # 检查是否有-45度或45度旋转
+    has_45_rotation = any(abs(abs(t['rotation']) - 45) < 1 for t in rotated_texts)
     
-    drawings = page.get_drawings()
-    circles_detected = 0
-    
-    for drawing in drawings:
-        detected_type = parser._detect_shape_type(drawing)
-        rect = drawing.get('rect')
-        
-        if detected_type == 'oval':
-            circles_detected += 1
-            print(f"✓ Circle detected at ({rect.x0:.1f}, {rect.y0:.1f}), size: {rect.width:.1f}x{rect.height:.1f}")
-    
-    doc.close()
-    
-    print(f"\nResult: {circles_detected} circles detected")
-    if circles_detected >= 5:
-        print("✅ PASS: Circles are properly detected (expected at least 5)")
+    if has_45_rotation:
+        logger.info("✅ 发现45度旋转的文本")
         return True
     else:
-        print("❌ FAIL: Not enough circles detected")
+        logger.warning("⚠️ 未发现45度旋转的文本")
         return False
 
 
-def verify_lines_on_page_4(pdf_path):
-    """Verify triangle lines are detected on page 4"""
-    print("\n" + "="*80)
-    print("VERIFICATION 2: Page 4 - Triangle Line Detection")
-    print("="*80)
+def verify_page15_star(pptx_path):
+    """验证第15页星星形状"""
+    prs = Presentation(pptx_path)
+    slide = prs.slides[14]  # Page 15 (0-indexed)
     
-    doc = fitz.open(pdf_path)
-    page = doc[3]  # Page 4 (0-indexed)
+    logger.info("\n" + "=" * 80)
+    logger.info("验证第15页：星星形状")
+    logger.info("=" * 80)
     
-    sys.path.insert(0, str(Path.cwd()))
-    from src.parser.pdf_parser import PDFParser
+    star_count = 0
+    for shape in slide.shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+            if hasattr(shape, 'auto_shape_type'):
+                # 检查是否是星星形状
+                shape_type_str = str(shape.auto_shape_type)
+                if 'STAR' in shape_type_str:
+                    star_count += 1
+                    logger.info(f"找到星星形状: {shape_type_str}")
+                    logger.info(f"  位置: ({shape.left/914400:.2f}in, {shape.top/914400:.2f}in)")
+                    logger.info(f"  尺寸: {shape.width/914400:.2f}in x {shape.height/914400:.2f}in")
     
-    config = {'dpi': 300, 'extract_images': True}
-    parser = PDFParser(config)
+    if star_count > 0:
+        logger.info(f"✅ 找到 {star_count} 个星星形状")
+        return True
+    else:
+        logger.warning("⚠️ 未找到星星形状")
+        return False
+
+
+def verify_page6_no_zero_rectangles(pptx_path):
+    """验证第6页没有零尺寸矩形"""
+    prs = Presentation(pptx_path)
+    slide = prs.slides[5]  # Page 6 (0-indexed)
     
-    drawings = page.get_drawings()
-    lines_detected = 0
-    diagonal_lines = 0
+    logger.info("\n" + "=" * 80)
+    logger.info("验证第6页：无零尺寸矩形")
+    logger.info("=" * 80)
     
-    for drawing in drawings:
-        detected_type = parser._detect_shape_type(drawing)
-        rect = drawing.get('rect')
+    zero_count = 0
+    total_shapes = 0
+    
+    for shape in slide.shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+            total_shapes += 1
+            if shape.width == 0 or shape.height == 0:
+                zero_count += 1
+                logger.warning(f"  发现零尺寸矩形: {shape.name}")
+                logger.warning(f"    尺寸: {shape.width} x {shape.height}")
+    
+    logger.info(f"总形状数: {total_shapes}")
+    logger.info(f"零尺寸矩形数: {zero_count}")
+    
+    if zero_count == 0:
+        logger.info("✅ 没有零尺寸矩形")
+        return True
+    else:
+        logger.warning(f"⚠️ 发现 {zero_count} 个零尺寸矩形")
+        return False
+
+
+def compare_element_counts(baseline_path, fixed_path):
+    """比较基线和修复版本的元素数量"""
+    logger.info("\n" + "=" * 80)
+    logger.info("比较元素数量（基线 vs 修复）")
+    logger.info("=" * 80)
+    
+    baseline_prs = Presentation(baseline_path)
+    fixed_prs = Presentation(fixed_path)
+    
+    all_match = True
+    
+    for page_num in range(min(len(baseline_prs.slides), len(fixed_prs.slides))):
+        baseline_slide = baseline_prs.slides[page_num]
+        fixed_slide = fixed_prs.slides[page_num]
         
-        if detected_type == 'line':
-            lines_detected += 1
-            width = rect.width
-            height = rect.height
-            
-            # Check if diagonal (both dimensions significant)
-            if width > 50 and height > 50:
-                diagonal_lines += 1
-                print(f"✓ Diagonal line detected: {width:.1f}x{height:.1f} at ({rect.x0:.1f}, {rect.y0:.1f})")
+        baseline_count = len(baseline_slide.shapes)
+        fixed_count = len(fixed_slide.shapes)
+        
+        # 对于第6页，修复版应该少一些元素（去掉了零尺寸矩形）
+        if page_num == 5:  # Page 6
+            if fixed_count < baseline_count:
+                logger.info(f"第{page_num+1}页: {baseline_count} → {fixed_count} (-{baseline_count-fixed_count}) ✅ 预期减少")
             else:
-                print(f"✓ Line detected: {width:.1f}x{height:.1f} at ({rect.x0:.1f}, {rect.y0:.1f})")
+                logger.warning(f"第{page_num+1}页: {baseline_count} → {fixed_count} ⚠️ 未减少")
+                all_match = False
+        elif page_num == 14:  # Page 15
+            # 第15页：过滤了零尺寸形状，所以元素会减少
+            if fixed_count < baseline_count:
+                logger.info(f"第{page_num+1}页: {baseline_count} → {fixed_count} (-{baseline_count-fixed_count}) ✅ 过滤零尺寸形状")
+            elif fixed_count == baseline_count:
+                logger.info(f"第{page_num+1}页: {baseline_count} → {fixed_count} ✅")
+            else:
+                logger.warning(f"第{page_num+1}页: {baseline_count} → {fixed_count} ⚠️ 元素增加")
+                all_match = False
+        else:
+            # 其他页面：修复版应该少一些元素（去掉了零尺寸形状）
+            # 这是预期的改进，不是bug
+            if fixed_count <= baseline_count:
+                logger.debug(f"第{page_num+1}页: {baseline_count} → {fixed_count} ✅")
+            else:
+                logger.warning(f"第{page_num+1}页: {baseline_count} → {fixed_count} ⚠️ 元素增加了")
+                all_match = False
     
-    doc.close()
-    
-    print(f"\nResult: {lines_detected} lines total, {diagonal_lines} diagonal lines")
-    if diagonal_lines >= 2:
-        print("✅ PASS: Triangle diagonal lines are detected (expected at least 2)")
-        return True
-    else:
-        print("❌ FAIL: Missing diagonal lines for triangle")
-        return False
-
-
-def verify_image_quality_page_6(pdf_path):
-    """Verify large images will be re-rendered on page 6"""
-    print("\n" + "="*80)
-    print("VERIFICATION 3: Page 6 - Large Image Quality")
-    print("="*80)
-    
-    doc = fitz.open(pdf_path)
-    page = doc[5]  # Page 6 (0-indexed)
-    
-    sys.path.insert(0, str(Path.cwd()))
-    from src.parser.pdf_parser import PDFParser
-    from PIL import Image
-    import io
-    
-    config = {'dpi': 300, 'extract_images': True}
-    parser = PDFParser(config)
-    
-    images = page.get_images()
-    large_images_to_rerender = 0
-    
-    for img_info in images:
-        xref = img_info[0]
-        base_image = doc.extract_image(xref)
-        
-        if base_image:
-            pil_image = Image.open(io.BytesIO(base_image['image']))
-            quality_status = parser._check_image_quality(pil_image)
-            
-            if pil_image.width > 200 or pil_image.height > 200:
-                if quality_status == 'rerender':
-                    large_images_to_rerender += 1
-                    print(f"✓ Large image will be re-rendered: {pil_image.width}x{pil_image.height}px")
-                else:
-                    print(f"  Large image: {pil_image.width}x{pil_image.height}px (status: {quality_status})")
-    
-    doc.close()
-    
-    print(f"\nResult: {large_images_to_rerender} large images marked for re-rendering")
-    if large_images_to_rerender >= 3:
-        print("✅ PASS: Large images will be re-rendered for better quality (expected at least 3)")
-        return True
-    else:
-        print("❌ FAIL: Not enough large images marked for re-rendering")
-        return False
+    return all_match
 
 
 def main():
-    pdf_path = "tests/season_report_del.pdf"
+    baseline_path = "output_baseline.pptx"
+    fixed_path = "output_fixed.pptx"
     
-    print("="*80)
-    print("VERIFYING SEASON_REPORT_DEL.PDF FIXES")
-    print("="*80)
+    results = {
+        'rotation': verify_page15_rotation(fixed_path),
+        'star': verify_page15_star(fixed_path),
+        'no_zero': verify_page6_no_zero_rectangles(fixed_path),
+        'counts': compare_element_counts(baseline_path, fixed_path)
+    }
     
-    # Run all verifications
-    test1 = verify_circles_on_page_2(pdf_path)
-    test2 = verify_lines_on_page_4(pdf_path)
-    test3 = verify_image_quality_page_6(pdf_path)
+    logger.info("\n" + "=" * 80)
+    logger.info("验证结果总结")
+    logger.info("=" * 80)
     
-    # Summary
-    print("\n" + "="*80)
-    print("VERIFICATION SUMMARY")
-    print("="*80)
-    print(f"1. Circle detection (Page 2):      {'✅ PASS' if test1 else '❌ FAIL'}")
-    print(f"2. Triangle lines (Page 4):        {'✅ PASS' if test2 else '❌ FAIL'}")
-    print(f"3. Large image quality (Page 6):   {'✅ PASS' if test3 else '❌ FAIL'}")
+    all_passed = all(results.values())
     
-    if all([test1, test2, test3]):
-        print("\n🎉 ALL VERIFICATIONS PASSED!")
-        return 0
+    for test_name, passed in results.items():
+        status = "✅ 通过" if passed else "❌ 失败"
+        logger.info(f"{test_name}: {status}")
+    
+    if all_passed:
+        logger.info("\n🎉 所有验证通过！")
     else:
-        print("\n⚠️  SOME VERIFICATIONS FAILED")
-        return 1
+        logger.warning("\n⚠️ 部分验证失败，请检查")
+    
+    return all_passed
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    import sys
+    success = main()
+    sys.exit(0 if success else 1)

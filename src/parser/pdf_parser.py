@@ -227,6 +227,10 @@ class PDFParser:
         for block in text_dict.get("blocks", []):
             if block.get("type") == 0:  # Text block
                 for line in block.get("lines", []):
+                    # Extract text direction from line
+                    # dir field is a tuple (dx, dy) indicating text direction
+                    line_dir = line.get("dir", (1.0, 0.0))
+                    
                     for span in line.get("spans", []):
                         # Filter by font size
                         font_size = span.get("size", 0)
@@ -238,6 +242,19 @@ class PDFParser:
                         
                         if not text:
                             continue
+                        
+                        # Calculate rotation angle from direction vector
+                        # dir is (dx, dy) - the direction of text baseline
+                        # angle = atan2(dy, dx) in radians, convert to degrees
+                        import math
+                        dx, dy = line_dir
+                        rotation_angle = math.degrees(math.atan2(dy, dx))
+                        
+                        # Normalize angle to [-180, 180] range
+                        while rotation_angle > 180:
+                            rotation_angle -= 360
+                        while rotation_angle < -180:
+                            rotation_angle += 360
                         
                         element = {
                             'type': 'text',
@@ -253,7 +270,9 @@ class PDFParser:
                             'color': self._rgb_to_hex(span.get("color", 0)),
                             'flags': span.get("flags", 0),  # bold, italic, etc.
                             'is_bold': bool(span.get("flags", 0) & 2**4),
-                            'is_italic': bool(span.get("flags", 0) & 2**1)
+                            'is_italic': bool(span.get("flags", 0) & 2**1),
+                            'rotation': rotation_angle,  # Add rotation angle in degrees
+                            'text_dir': line_dir  # Store original direction vector for reference
                         }
                         
                         text_elements.append(element)
@@ -959,6 +978,14 @@ class PDFParser:
         if line_count == 3 and curve_count == 0:
             logger.debug(f"Detected triangle: 3 lines")
             return 'triangle'
+        
+        # 3.5. Star Detection
+        # Stars have 10 lines forming a closed path (5 outer points + 5 inner points)
+        # Check for aspect ratio close to 1.0 and 10 line segments
+        if line_count == 10 and curve_count == 0:
+            if 0.8 <= aspect_ratio <= 1.2:  # Nearly square
+                logger.debug(f"Detected star: 10 lines, aspect {aspect_ratio:.3f}")
+                return 'star'
         
         # 4. Rectangle Detection
         # Explicit rectangle command OR 4 lines forming a rectangle

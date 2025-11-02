@@ -277,7 +277,8 @@ class CoordinateMapper:
             'font_size': first_elem.get('font_size', 18),
             'color': first_elem.get('color', '#000000'),
             'bold': first_elem.get('is_bold', False),
-            'italic': first_elem.get('is_italic', False)
+            'italic': first_elem.get('is_italic', False),
+            'rotation': first_elem.get('rotation', 0)  # Add rotation support
         }
         
         return style

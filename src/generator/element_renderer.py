@@ -151,6 +151,14 @@ class ElementRenderer:
             # Disable word wrap to prevent forced line breaks
             text_frame.word_wrap = False
             
+            # Apply rotation if specified
+            rotation = style.get('rotation', 0)
+            if rotation != 0:
+                # PowerPoint rotation is clockwise, PDF rotation is counter-clockwise
+                # So we need to negate the angle
+                textbox.rotation = -rotation
+                logger.debug(f"Applied rotation {-rotation}° to text: {content[:30]}")
+            
             return textbox
             
         except Exception as e:
@@ -226,6 +234,12 @@ class ElementRenderer:
         top = Inches(position['y'])
         width = Inches(position['width'])
         height = Inches(position['height'])
+        
+        # Filter out zero-dimension shapes (these are rendering artifacts)
+        # Zero width or height shapes cannot be rendered and cause visual clutter
+        if width.inches == 0 or height.inches == 0:
+            logger.warning(f"Skipping zero-dimension shape: w={width.inches:.4f}, h={height.inches:.4f}")
+            return None
         
         # Ensure minimum dimensions (but allow thin borders)
         # Check if it's a border (thin vertical or horizontal shape)
@@ -342,6 +356,7 @@ class ElementRenderer:
                 'ellipse': MSO_SHAPE.OVAL,
                 'line': MSO_SHAPE.RECTANGLE,  # Fallback for lines with fill
                 'triangle': MSO_SHAPE.RECTANGLE,  # Triangles as rectangles for now
+                'star': MSO_SHAPE.STAR_5_POINT,  # 5-point star
                 'path': MSO_SHAPE.RECTANGLE,
                 'f': MSO_SHAPE.RECTANGLE,  # Fill path - default to rectangle
                 's': MSO_SHAPE.RECTANGLE   # Stroke path - default to rectangle
