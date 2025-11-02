@@ -293,9 +293,10 @@ class ChartDetector:
         x1 = max(shape['x2'] for shape in cluster)
         y1 = max(shape['y2'] for shape in cluster)
         
-        # Add small padding (5% on each side)
-        padding_x = (x1 - x0) * 0.05
-        padding_y = (y1 - y0) * 0.05
+        # Add minimal padding (2% on each side) to avoid capturing surrounding content
+        # Previous 5% was too large and would capture nearby text/shapes
+        padding_x = (x1 - x0) * 0.02
+        padding_y = (y1 - y0) * 0.02
         
         return (
             max(0, x0 - padding_x),

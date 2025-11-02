@@ -272,6 +272,10 @@ class LayoutAnalyzerV2:
             elem_x2 = elem.get('x2', 0)
             elem_font_size = elem.get('font_size', 0)
             elem_color = elem.get('color', '')
+            elem_rotation = elem.get('rotation', 0)
+            
+            # Check if this is rotated text
+            is_rotated = abs(elem_rotation) > 5  # More than 5 degrees
             
             # Look for elements on the same line or closely positioned
             # Important: Track the rightmost x2 of the current group for gap calculation
@@ -290,6 +294,7 @@ class LayoutAnalyzerV2:
                 other_x2 = other.get('x2', 0)
                 other_font_size = other.get('font_size', 0)
                 other_color = other.get('color', '')
+                other_rotation = other.get('rotation', 0)
                 
                 # Same line criteria
                 y_diff = abs(other_y - elem_y)
@@ -301,6 +306,47 @@ class LayoutAnalyzerV2:
                 other_is_bold = other.get('is_bold', False)
                 other_is_italic = other.get('is_italic', False)
                 same_style = (elem_is_bold == other_is_bold) and (elem_is_italic == other_is_italic)
+                
+                # Check if both elements have similar rotation (for rotated text grouping)
+                same_rotation = abs(elem_rotation - other_rotation) < 5  # Within 5 degrees
+                
+                # Special handling for rotated text (especially brackets)
+                # For rotated text, we need to use bbox-based distance instead of simple gap
+                if is_rotated and same_rotation:
+                    # Calculate center-to-center distance for rotated text
+                    elem_center_x = (elem_x + elem_x2) / 2
+                    elem_center_y = (elem_y + elem_y2) / 2
+                    other_center_x = (other_x + other_x2) / 2
+                    other_center_y = (other_y + other_y2) / 2
+                    
+                    # Euclidean distance
+                    distance = ((elem_center_x - other_center_x) ** 2 + 
+                               (elem_center_y - other_center_y) ** 2) ** 0.5
+                    
+                    # Check if this is bracket-related text
+                    elem_text = elem.get('content', '')
+                    other_text = other.get('content', '')
+                    has_bracket = any(c in elem_text + other_text for c in ['(', ')', '（', '）'])
+                    has_ip = any(c.isdigit() and '.' in elem_text for c in elem_text.split('.')) or \
+                            any(c.isdigit() and '.' in other_text for c in other_text.split('.'))
+                    has_chinese = self._has_cjk_characters(elem_text) or self._has_cjk_characters(other_text)
+                    
+                    # For rotated text with IP address + bracket + Chinese pattern
+                    # Use more aggressive grouping (within ~50pt for -45° rotated text)
+                    if has_bracket or (has_ip and has_chinese):
+                        # More lenient grouping for IP+bracket+Chinese pattern
+                        if distance < 50 and abs(other_font_size - elem_font_size) <= 2:
+                            should_group = True
+                            merge_reason = "rotated text with bracket/IP/Chinese pattern"
+                            
+                            # Add to group
+                            group_elements.append(other)
+                            processed.add(id(other))
+                            current_x2 = max(current_x2, other_x2)
+                            
+                            logger.debug(f"Merging rotated text '{elem_text}' + '{other_text}' "
+                                       f"(distance={distance:.2f}pt, rotation={elem_rotation:.1f}°, reason={merge_reason})")
+                            continue
                 
                 # Group if on same line and close horizontal proximity
                 # Use content-aware merging to prevent overlaps

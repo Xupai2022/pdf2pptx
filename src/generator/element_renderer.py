@@ -154,10 +154,14 @@ class ElementRenderer:
             # Apply rotation if specified
             rotation = style.get('rotation', 0)
             if rotation != 0:
-                # PowerPoint rotation is clockwise, PDF rotation is counter-clockwise
-                # So we need to negate the angle
-                textbox.rotation = -rotation
-                logger.debug(f"Applied rotation {-rotation}° to text: {content[:30]}")
+                # PDF和PPT的旋转系统:
+                # - PDF中atan2(dy, dx)计算的角度: dy>0表示向下倾斜(\), dy<0表示向上倾斜(/)
+                # - PPT中rotation: 正值为顺时针(\), 负值为逆时针(/)
+                # - PDF的dir=(0.707, -0.707)表示/方向, atan2计算得-45°
+                # - PPT需要-45°来显示/方向
+                # 结论: 直接使用PDF角度，不需要取反
+                textbox.rotation = rotation
+                logger.debug(f"Applied rotation {rotation}° to text: {content[:30]}")
             
             return textbox
             
