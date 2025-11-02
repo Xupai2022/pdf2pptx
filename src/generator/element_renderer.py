@@ -239,11 +239,26 @@ class ElementRenderer:
         width = Inches(position['width'])
         height = Inches(position['height'])
         
-        # Filter out zero-dimension shapes (these are rendering artifacts)
-        # Zero width or height shapes cannot be rendered and cause visual clutter
-        if width.inches == 0 or height.inches == 0:
+        # Filter out TRUE zero-dimension shapes (both width and height are zero)
+        # BUT allow thin lines (one dimension is very small but not zero)
+        # This is critical for rendering horizontal/vertical lines in tables and charts
+        if width.inches == 0 and height.inches == 0:
             logger.warning(f"Skipping zero-dimension shape: w={width.inches:.4f}, h={height.inches:.4f}")
             return None
+        
+        # For shapes with one zero dimension, convert to thin line
+        # E.g., horizontal line: width > 0, height = 0 -> height = 0.01
+        # E.g., vertical line: width = 0, height > 0 -> width = 0.01
+        min_line_thickness = Inches(0.01)  # 0.01 inches = 0.72 pt (very thin but visible)
+        
+        if width.inches == 0 and height.inches > 0:
+            # Vertical line (zero width but has height)
+            width = min_line_thickness
+            logger.info(f"Adjusted zero-width vertical line to {min_line_thickness.inches:.4f} inches (height={height.inches:.4f})")
+        elif height.inches == 0 and width.inches > 0:
+            # Horizontal line (zero height but has width)
+            height = min_line_thickness
+            logger.info(f"Adjusted zero-height horizontal line to {min_line_thickness.inches:.4f} inches (width={width.inches:.4f})")
         
         # Ensure minimum dimensions (but allow thin borders)
         # Check if it's a border (thin vertical or horizontal shape)
