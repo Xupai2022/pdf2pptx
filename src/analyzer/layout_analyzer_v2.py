@@ -290,6 +290,7 @@ class LayoutAnalyzerV2:
                     continue
                 
                 other_y = other.get('y', 0)
+                other_y2 = other.get('y2', 0)
                 other_x = other.get('x', 0)
                 other_x2 = other.get('x2', 0)
                 other_font_size = other.get('font_size', 0)
