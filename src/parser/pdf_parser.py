@@ -926,27 +926,44 @@ class PDFParser:
         # DETECTION LOGIC (order matters - most specific first)
         
         # 1. Circle/Oval Detection
-        # Circles use Bezier curves (typically 4 curves + connecting lines)
-        # Key indicators: 4+ curves, aspect ratio near 1.0 (circle) or moderately different (ellipse)
-        # IMPORTANT: Rounded rectangles also have 4 curves (one per corner) but with extreme aspect ratios
+        # Circles use Bezier curves (typically many curves without lines)
+        # Key indicators: Many curves (40+), NO or very few lines, aspect ratio reasonable
+        # IMPORTANT: Rounded rectangles also have curves but with straight line segments
         if curve_count >= 4:
-            # Check aspect ratio to distinguish between:
-            # - Circles/Ovals: aspect ratio 0.5 to 2.0 (not too extreme)
-            # - Rounded rectangles: aspect ratio < 0.5 or > 2.0 (very elongated)
+            # Distinguish between rounded rectangles and true ovals/circles:
+            # - Rounded rectangles: fewer curves (4-32), has line segments, any aspect ratio
+            # - True ovals/circles: many curves (40+), no/few lines, aspect ratio 0.5-2.0
             
-            if 0.9 <= aspect_ratio <= 1.1:
-                # Nearly square aspect ratio = circle
-                logger.debug(f"Detected circle: {curve_count} curves, aspect {aspect_ratio:.3f}")
-                return 'oval'
-            elif 0.5 <= aspect_ratio <= 2.0:
-                # Moderate aspect ratio = ellipse/oval
-                logger.debug(f"Detected oval/ellipse: {curve_count} curves, aspect {aspect_ratio:.3f}")
-                return 'oval'
-            else:
-                # Extreme aspect ratio (< 0.5 or > 2.0) = rounded rectangle
-                # Even though it has 4 curves, the shape is clearly rectangular
-                logger.debug(f"Detected rounded rectangle: {curve_count} curves, aspect {aspect_ratio:.3f} (too extreme for oval)")
+            # Check if this is a rounded rectangle (has line segments connecting curves)
+            if line_count > 0:
+                # Has straight line segments = rounded rectangle
+                logger.debug(f"Detected rounded rectangle: {curve_count} curves + {line_count} lines, aspect {aspect_ratio:.3f}")
                 return 'rectangle'
+            
+            # No lines - check curve count and aspect ratio
+            if curve_count >= 40:
+                # Many curves without lines = true oval/circle
+                if 0.9 <= aspect_ratio <= 1.1:
+                    logger.debug(f"Detected circle: {curve_count} curves (no lines), aspect {aspect_ratio:.3f}")
+                    return 'oval'
+                elif 0.5 <= aspect_ratio <= 2.0:
+                    logger.debug(f"Detected oval/ellipse: {curve_count} curves (no lines), aspect {aspect_ratio:.3f}")
+                    return 'oval'
+                else:
+                    # Very elongated shape even with many curves
+                    logger.debug(f"Detected elongated rounded rectangle: {curve_count} curves, aspect {aspect_ratio:.3f}")
+                    return 'rectangle'
+            else:
+                # Fewer curves (< 40) without lines - likely a rounded rectangle with curved corners only
+                # Aspect ratio matters here
+                if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+                    logger.debug(f"Detected rounded rectangle: {curve_count} curves (no lines), extreme aspect {aspect_ratio:.3f}")
+                    return 'rectangle'
+                else:
+                    # Moderate curve count, moderate aspect ratio, no lines
+                    # This is ambiguous - default to rectangle for safety
+                    logger.debug(f"Detected rounded rectangle (ambiguous): {curve_count} curves, aspect {aspect_ratio:.3f}")
+                    return 'rectangle'
         
         # 2. Line Detection (single line, stroke-only shapes)
         # Lines are critical for triangles and other geometric shapes

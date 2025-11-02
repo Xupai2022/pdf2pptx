@@ -84,9 +84,9 @@ class StyleMapper:
         color = style.get('color', '#000000')
         rgb = self.hex_to_rgb(color)
         
-        # Bold and italic
-        is_bold = style.get('bold', False)
-        is_italic = style.get('italic', False)
+        # Bold and italic - support both 'bold'/'italic' and 'is_bold'/'is_italic' keys
+        is_bold = style.get('is_bold', style.get('bold', False))
+        is_italic = style.get('is_italic', style.get('italic', False))
         
         # Apply to all runs in paragraph
         for run in paragraph.runs:

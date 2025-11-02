@@ -333,21 +333,51 @@ class LayoutAnalyzerV2:
                     has_chinese = self._has_cjk_characters(elem_text) or self._has_cjk_characters(other_text)
                     
                     # For rotated text with IP address + bracket + Chinese pattern
-                    # Use more aggressive grouping (within ~50pt for -45° rotated text)
+                    # Use smart grouping based on context:
+                    # 1. Brackets and their content should be merged together: "(" + "text" + ")"
+                    # 2. IP address should NOT merge with bracket group if they appear to be separate lines
                     if has_bracket or (has_ip and has_chinese):
-                        # More lenient grouping for IP+bracket+Chinese pattern
-                        if distance < 50 and abs(other_font_size - elem_font_size) <= 2:
-                            should_group = True
-                            merge_reason = "rotated text with bracket/IP/Chinese pattern"
-                            
-                            # Add to group
-                            group_elements.append(other)
-                            processed.add(id(other))
-                            current_x2 = max(current_x2, other_x2)
-                            
-                            logger.debug(f"Merging rotated text '{elem_text}' + '{other_text}' "
-                                       f"(distance={distance:.2f}pt, rotation={elem_rotation:.1f}°, reason={merge_reason})")
-                            continue
+                        # Check content types
+                        elem_is_ip = any(c.isdigit() and '.' in elem_text for c in elem_text.split('.'))
+                        other_is_ip = any(c.isdigit() and '.' in other_text for c in other_text.split('.'))
+                        elem_has_bracket = any(c in elem_text for c in ['(', ')', '（', '）'])
+                        other_has_bracket = any(c in other_text for c in ['(', ')', '（', '）'])
+                        
+                        # Check if one element is ONLY an IP address (no brackets)
+                        elem_is_pure_ip = elem_is_ip and not elem_has_bracket
+                        other_is_pure_ip = other_is_ip and not other_has_bracket
+                        
+                        # Case 1: Pure IP + bracket text
+                        # These are likely separate lines - do NOT merge unless VERY close (< 8pt)
+                        if (elem_is_pure_ip and other_has_bracket) or (other_is_pure_ip and elem_has_bracket):
+                            # IP address and bracket text - these are separate lines
+                            # Only merge if extremely close (< 8pt = essentially touching)
+                            if distance < 8 and abs(other_font_size - elem_font_size) <= 2:
+                                should_group = True
+                                merge_reason = "IP and bracket (same position)"
+                                
+                                group_elements.append(other)
+                                processed.add(id(other))
+                                current_x2 = max(current_x2, other_x2)
+                                
+                                logger.debug(f"Merging rotated text '{elem_text}' + '{other_text}' "
+                                           f"(distance={distance:.2f}pt, rotation={elem_rotation:.1f}°, reason={merge_reason})")
+                                continue
+                        
+                        # Case 2: Bracket-related elements (forming "(text)" group)
+                        # These should merge with moderate distance (< 50pt)
+                        elif has_bracket:
+                            if distance < 50 and abs(other_font_size - elem_font_size) <= 2:
+                                should_group = True
+                                merge_reason = "bracket group elements"
+                                
+                                group_elements.append(other)
+                                processed.add(id(other))
+                                current_x2 = max(current_x2, other_x2)
+                                
+                                logger.debug(f"Merging rotated text '{elem_text}' + '{other_text}' "
+                                           f"(distance={distance:.2f}pt, rotation={elem_rotation:.1f}°, reason={merge_reason})")
+                                continue
                 
                 # Group if on same line and close horizontal proximity
                 # Use content-aware merging to prevent overlaps
