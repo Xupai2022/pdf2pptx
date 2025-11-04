@@ -381,7 +381,9 @@ class PDFParser:
                                       f"original bbox ({rect.x0:.1f}, {rect.y0:.1f}, {rect.x1:.1f}, {rect.y1:.1f})")
                             zoom = 4.0  # High resolution
                             matrix = fitz.Matrix(zoom, zoom)
-                            region_pix = page.get_pixmap(matrix=matrix, clip=safe_rect, alpha=False)
+                            # CRITICAL FIX: Use alpha=True to preserve transparency!
+                            # This prevents PNG images from getting black backgrounds
+                            region_pix = page.get_pixmap(matrix=matrix, clip=safe_rect, alpha=True)
                             image_bytes = region_pix.tobytes("png")
                             image_ext = "png"
                             
@@ -395,7 +397,9 @@ class PDFParser:
                             logger.warning(f"Re-rendering corrupted image at page {page_num} (has overlaps but required)")
                             zoom = 4.0
                             matrix = fitz.Matrix(zoom, zoom)
-                            region_pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=False)
+                            # CRITICAL FIX: Use alpha=True to preserve transparency!
+                            # This prevents PNG images from getting black backgrounds
+                            region_pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=True)
                             image_bytes = region_pix.tobytes("png")
                             image_ext = "png"
                             pil_image = Image.open(io.BytesIO(image_bytes))
@@ -1184,12 +1188,38 @@ class PDFParser:
                     logger.debug(f"Detected truly corrupted image: {width}x{height}, all {('black' if is_black else 'white')}")
                     return ('rerender', False)
             
-            # Check 2: Low-quality embedded icon detection
+            # Check 2: PNG images with black background (lost alpha channel)
+            # These are RGB PNG images that should have transparency but have black backgrounds instead
+            # This happens when alpha channel is lost during PDF conversion
+            #
+            # Detection strategy:
+            # - RGB mode (no alpha channel)
+            # - Significant number of black pixels in corner/edge samples (>= 4 out of 9)
+            # - Not purely black (has some non-black content)
+            # - Any size can be affected
+            
+            has_no_alpha = pil_image.mode == 'RGB'
+            
+            if has_no_alpha:
+                # Count black pixels in corner/edge samples
+                black_count = sum(1 for p in pixels if all(c < 30 for c in p[:3]))
+                
+                # If image has significant black edges but is not purely black
+                if black_count >= 4 and black_count < len(pixels):
+                    # Check if there are also some colored pixels (not just black)
+                    has_color = any(max(p[:3]) > 30 for p in pixels)
+                    
+                    if has_color:
+                        # This is likely an image with lost alpha channel (transparent areas became black)
+                        logger.info(
+                            f"Detected PNG with black background (lost alpha): {width}x{height}px, "
+                            f"{black_count}/{len(pixels)} black edge pixels - will re-render with transparency"
+                        )
+                        return ('rerender', False)
+            
+            # Check 3: Low-quality embedded icon detection
             # These are small PNG icons with no alpha channel and limited colors
             # IMPORTANT: This check only applies to embedded images, NOT vector shapes
-            
-            # Condition 1: No alpha channel (RGB mode)
-            has_no_alpha = pil_image.mode == 'RGB'
             
             # Condition 2: Small size (typical for icons)
             is_small = (width <= 100 or height <= 100)
@@ -1211,7 +1241,7 @@ class PDFParser:
                     )
                     return ('rerender', False)
             
-            # Check 3: Large PNG images - NOW ENABLED with smart overlap detection
+            # Check 4: Large PNG images - NOW ENABLED with smart overlap detection
             # 
             # CRITICAL FIX v2: We NOW enable large image rerendering but with smart overlap detection.
             # The _extract_images method will call _calculate_safe_rerender_bbox to:
@@ -1234,7 +1264,7 @@ class PDFParser:
                     f"Detected large PNG image: {width}x{height}px - may re-render if no text/shape overlaps"
                 )
             
-            # Check 4: Low-quality rasterized vector graphics
+            # Check 5: Low-quality rasterized vector graphics
             # These are medium-sized PNG images that are actually poorly rasterized vector shapes
             # They should be skipped entirely to allow the underlying vector shapes to be used
             # 
