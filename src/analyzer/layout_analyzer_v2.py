@@ -47,6 +47,47 @@ class LayoutAnalyzerV2:
         return cleaned.isalpha() and cleaned.isascii()
     
     @staticmethod
+    def _colors_similar(color1: str, color2: str, threshold: int = 30) -> bool:
+        """
+        检查两个十六进制颜色是否相似
+        
+        Args:
+            color1: 第一个颜色（如'#000000'或'#14161A'）
+            color2: 第二个颜色
+            threshold: RGB差异阈值（0-255），默认30
+            
+        Returns:
+            如果颜色相似则返回True
+        """
+        # 处理空值
+        if not color1 or not color2:
+            return color1 == color2
+        
+        # 移除'#'前缀
+        c1 = color1.lstrip('#')
+        c2 = color2.lstrip('#')
+        
+        # 确保长度为6
+        if len(c1) != 6 or len(c2) != 6:
+            return color1 == color2
+        
+        try:
+            # 解析RGB值
+            r1, g1, b1 = int(c1[0:2], 16), int(c1[2:4], 16), int(c1[4:6], 16)
+            r2, g2, b2 = int(c2[0:2], 16), int(c2[2:4], 16), int(c2[4:6], 16)
+            
+            # 计算欧几里得距离
+            distance = ((r1-r2)**2 + (g1-g2)**2 + (b1-b2)**2) ** 0.5
+            
+            # 阈值转换为欧几里得空间（sqrt(3) * threshold）
+            max_distance = (threshold ** 2 * 3) ** 0.5
+            
+            return distance <= max_distance
+        except ValueError:
+            # 解析失败，使用严格匹配
+            return color1 == color2
+    
+    @staticmethod
     def _has_cjk_characters(text: str) -> bool:
         """检查文本是否包含CJK字符（中日韩文字）或CJK标点符号"""
         if not text:
@@ -413,9 +454,11 @@ class LayoutAnalyzerV2:
                         other_text = other.get('content', '')
                         
                         # First check style compatibility
+                        # 放宽颜色匹配：允许相近的颜色（如#000000和#14161A）
+                        colors_match = LayoutAnalyzerV2._colors_similar(other_color, elem_color, threshold=30)
                         style_compatible = (
                             abs(other_font_size - elem_font_size) <= 2 and
-                            other_color == elem_color and
+                            colors_match and
                             same_style
                         )
                         
@@ -435,9 +478,11 @@ class LayoutAnalyzerV2:
                             elem_text = elem.get('content', '')
                             other_text = other.get('content', '')
                             
+                            # 放宽颜色匹配：允许相近的颜色（如#000000和#14161A）
+                            colors_match = LayoutAnalyzerV2._colors_similar(other_color, elem_color, threshold=30)
                             style_compatible = (
                                 abs(other_font_size - elem_font_size) <= 2 and
-                                other_color == elem_color and
+                                colors_match and
                                 same_style
                             )
                             

@@ -139,7 +139,15 @@ class ElementRenderer:
             estimated_width_inches = estimated_width_pt / 72.0
             
             # Use larger of provided width or estimated width (with 20% padding)
-            min_width = max(Inches(0.3), estimated_width_inches * 1.2)
+            # But only apply minimum width for longer texts (>3 chars)
+            # For short texts (1-3 chars like "0", "个"), use smaller minimum to avoid overlaps
+            if char_count <= 3:
+                # Short text: use smaller minimum width (0.05" ~= 3.6pt)
+                min_width = max(Inches(0.05), estimated_width_inches * 1.2)
+            else:
+                # Longer text: use original minimum width
+                min_width = max(Inches(0.3), estimated_width_inches * 1.2)
+            
             if width < min_width:
                 width = min_width
             
