@@ -196,10 +196,17 @@ class PDFParser:
                     chart_bbox[1] <= shape_center_y <= chart_bbox[3]):
                     chart_shape_ids.add(id(shape))
         
-        # Add only non-chart shapes to elements
-        for shape in drawing_elements:
-            if id(shape) not in chart_shape_ids:
-                page_data['elements'].append(shape)
+        # Filter non-chart shapes to remove text decoration shapes
+        non_chart_shapes = [shape for shape in drawing_elements if id(shape) not in chart_shape_ids]
+        
+        # CRITICAL: Filter out shapes that are text decorations (backgrounds/highlights)
+        # These shapes appear as unwanted rectangles in PowerPoint
+        filtered_shapes = self.text_overlap_detector.filter_text_decoration_shapes(
+            non_chart_shapes, filtered_text_elements
+        )
+        
+        # Add filtered shapes to elements
+        page_data['elements'].extend(filtered_shapes)
         
         # Filter out text elements that overlap with chart images
         if chart_regions:
