@@ -45,20 +45,22 @@ rebuilder:
 # Style Mapping Configuration
 mapper:
   # Font mapping (PDF font -> PPT font)
+  # CRITICAL: Use "Microsoft YaHei UI" (English name) instead of "微软雅黑" (Chinese name)
+  # Microsoft YaHei UI has real Bold font files, while "微软雅黑" only has algorithmic bold
   font_mapping:
-    # Chinese fonts
-    "SimHei": "微软雅黑"
+    # Chinese fonts - Use Microsoft YaHei UI for best bold rendering
+    "SimHei": "Microsoft YaHei UI"
     "SimSun": "宋体"
-    "MicrosoftYaHei": "微软雅黑"
-    "MicrosoftYaHei-Bold": "微软雅黑"
-    "MicrosoftYaHeiUI": "微软雅黑"
-    "Microsoft-YaHei": "微软雅黑"
+    "MicrosoftYaHei": "Microsoft YaHei UI"
+    "MicrosoftYaHei-Bold": "Microsoft YaHei UI"  # Use UI variant for real bold
+    "MicrosoftYaHeiUI": "Microsoft YaHei UI"
+    "Microsoft-YaHei": "Microsoft YaHei UI"
     "KaiTi": "楷体"
     "FangSong": "仿宋"
 
     # Alternative mappings for UI fonts
-    "Microsoft YaHei UI": "微软雅黑"
-    "Microsoft YaHei Bold": "微软雅黑"
+    "Microsoft YaHei UI": "Microsoft YaHei UI"
+    "Microsoft YaHei Bold": "Microsoft YaHei UI"  # Use UI variant, bold will be set via attribute
 
     # Western fonts
     "Helvetica": "Arial"

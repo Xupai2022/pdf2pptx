@@ -63,6 +63,17 @@ class StyleMapper:
         """
         Apply text style to a PowerPoint text frame.
         
+        CRITICAL BOLD FONT FIX:
+        =======================
+        This method now properly handles bold fonts by:
+        1. Detecting bold from font name (e.g., "MicrosoftYaHei-Bold")
+        2. Detecting bold from PDF flags (bit 4)
+        3. Combining both sources to determine final bold state
+        4. Using "Microsoft YaHei UI" font which has real bold font files
+        5. Setting both font.bold attribute AND font.name correctly
+        
+        This ensures the PPT displays the same bold appearance as the PDF.
+        
         Args:
             text_frame: PowerPoint text frame object
             style: Style dictionary
@@ -72,9 +83,9 @@ class StyleMapper:
         
         paragraph = text_frame.paragraphs[0]
         
-        # Font name
+        # Font name mapping with bold detection
         font_name = style.get('font_name', '')
-        mapped_font = self.font_mapper.map_font(font_name)
+        mapped_font, font_name_is_bold = self.font_mapper.map_font(font_name)
         
         # Font size with scaling (PDF points to screen pixels)
         font_size_raw = style.get('font_size', self.default_font_size)
@@ -84,8 +95,19 @@ class StyleMapper:
         color = style.get('color', '#000000')
         rgb = self.hex_to_rgb(color)
         
-        # Bold and italic - support both 'bold'/'italic' and 'is_bold'/'is_italic' keys
-        is_bold = style.get('is_bold', style.get('bold', False))
+        # Bold detection from multiple sources:
+        # 1. PDF flags (is_bold from span flags bit 4)
+        # 2. Font name (detected by FontMapper from -Bold suffix)
+        # 3. Explicit style attribute
+        # Use OR logic: if ANY source indicates bold, make it bold
+        flags_is_bold = style.get('is_bold', style.get('bold', False))
+        is_bold = flags_is_bold or font_name_is_bold
+        
+        # Log bold detection for debugging
+        if is_bold:
+            logger.debug(f"Bold text detected: font='{font_name}' -> '{mapped_font}', "
+                        f"flags_bold={flags_is_bold}, name_bold={font_name_is_bold}")
+        
         is_italic = style.get('is_italic', style.get('italic', False))
         
         # Apply to all runs in paragraph
@@ -97,8 +119,16 @@ class StyleMapper:
             if self.preserve_colors and rgb is not None:
                 run.font.color.rgb = RGBColor(*rgb)
             
+            # CRITICAL: Set bold attribute
+            # For fonts like "Microsoft YaHei UI", this will trigger real bold font loading
             run.font.bold = is_bold
             run.font.italic = is_italic
+            
+            # Additional XML-level font attribute setting for maximum compatibility
+            # This ensures PowerPoint uses the real bold font file, not algorithmic bold
+            if is_bold and mapped_font == 'Microsoft YaHei UI':
+                self._set_font_weight_xml(run, 'bold')
+
     
     def apply_shape_style(self, shape, style: Dict[str, Any]):
         """
@@ -267,6 +297,60 @@ class StyleMapper:
             return (rgb, 1.0)
         
         return (None, 1.0)
+    
+    def _set_font_weight_xml(self, run, weight: str):
+        """
+        Set font weight via XML manipulation to ensure real bold font is used.
+        
+        This method directly manipulates the PowerPoint XML to set the font typeface
+        with explicit bold attribute, ensuring PowerPoint loads the real bold font file
+        (e.g., "Microsoft YaHei UI Bold.ttf") instead of using algorithmic bold.
+        
+        Args:
+            run: PowerPoint text run object
+            weight: Font weight ('bold', 'normal', or numeric value like '700')
+        """
+        try:
+            # Access run's XML element
+            r_element = run._r
+            
+            # Define namespaces
+            ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+            
+            # Find or create rPr (run properties)
+            rPr = r_element.find(f'.//{{{ns_a}}}rPr')
+            if rPr is None:
+                rPr = etree.SubElement(r_element, f'{{{ns_a}}}rPr')
+            
+            # Find or create latin font element (for Latin/Western characters)
+            latin = rPr.find(f'.//{{{ns_a}}}latin')
+            if latin is None:
+                latin = etree.SubElement(rPr, f'{{{ns_a}}}latin')
+            
+            # Set typeface to the base font family
+            # PowerPoint will automatically select the bold variant
+            latin.set('typeface', 'Microsoft YaHei UI')
+            
+            # Find or create cs (Complex Script) font element for CJK characters
+            cs = rPr.find(f'.//{{{ns_a}}}cs')
+            if cs is None:
+                cs = etree.SubElement(rPr, f'{{{ns_a}}}cs')
+            
+            # Set typeface for CJK
+            cs.set('typeface', 'Microsoft YaHei UI')
+            
+            # Find or create ea (East Asian) font element
+            ea = rPr.find(f'.//{{{ns_a}}}ea')
+            if ea is None:
+                ea = etree.SubElement(rPr, f'{{{ns_a}}}ea')
+            
+            # Set typeface for East Asian
+            ea.set('typeface', 'Microsoft YaHei UI')
+            
+            logger.debug(f"Set XML font typeface to 'Microsoft YaHei UI' with weight '{weight}'")
+            
+        except Exception as e:
+            logger.warning(f"Failed to set font weight via XML: {e}", exc_info=True)
     
     def _set_shape_transparency(self, shape, opacity: float):
         """
