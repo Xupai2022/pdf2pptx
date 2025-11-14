@@ -21,6 +21,17 @@ analyzer:
   group_tolerance: 10  # Pixels tolerance for grouping elements
   detect_headers: true
   detect_footers: true
+  
+  # LayoutLM Enhancement (Optional - requires transformers + torch)
+  use_layoutlm: true  # Enable LayoutLM semantic analysis
+  layoutlm_model: "microsoft/layoutlmv3-base"
+  layoutlm_device: "auto"  # 'auto', 'cuda', or 'cpu'
+  
+  # Intelligent triggering conditions (only use LayoutLM when needed)
+  layoutlm_conditions:
+    min_text_blocks: 20      # Enable if text blocks >= 20 (complex layout)
+    complex_tables: true     # Enable if table detected
+    multi_column: true       # Enable if multi-column layout detected
 
 # Coordinate Mapping Configuration
 rebuilder:

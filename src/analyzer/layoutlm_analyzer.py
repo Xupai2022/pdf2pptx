@@ -95,7 +95,9 @@ class LayoutLMAnalyzer:
         
         logger.info(f"Loading LayoutLMv3 model '{model_name}' on {self.device}...")
         
-        self.processor = LayoutLMv3Processor.from_pretrained(model_name)
+        # 使用tokenizer而不是processor,因为我们已经有PyMuPDF提取的文本和bbox
+        from transformers import LayoutLMv3Tokenizer
+        self.tokenizer = LayoutLMv3Tokenizer.from_pretrained(model_name)
         self.model = LayoutLMv3ForTokenClassification.from_pretrained(model_name)
         self.model.to(self.device)
         self.model.eval()
@@ -209,7 +211,8 @@ class LayoutLMAnalyzer:
         text_elements = [(i, e) for i, e in enumerate(elements) if e.get('type') == 'text']
         
         for elem_idx, element in text_elements:
-            text = element.get('text', '').strip()
+            # 尝试两个字段: 'content' (新版) 或 'text' (旧版)
+            text = element.get('content', element.get('text', '')).strip()
             if not text:
                 continue
             
@@ -239,14 +242,15 @@ class LayoutLMAnalyzer:
         Returns:
             predictions: 预测标签列表
         """
-        # 准备输入
-        encoding = self.processor(
+        # 准备输入 - 使用tokenizer直接处理文本和bbox
+        encoding = self.tokenizer(
             text=words,
             boxes=boxes,
             return_tensors="pt",
             truncation=True,
             padding="max_length",
-            max_length=512
+            max_length=512,
+            is_split_into_words=True  # 已经分词
         )
         
         # 移动到设备

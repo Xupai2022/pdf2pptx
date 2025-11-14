@@ -43,7 +43,9 @@ def test_layoutlm_on_pdf(pdf_path: str):
     
     start = time.time()
     try:
-        processor = LayoutLMv3Processor.from_pretrained("microsoft/layoutlmv3-base")
+        # 使用tokenizer而不是processor,因为我们已经有文本和bbox
+        from transformers import LayoutLMv3Tokenizer
+        tokenizer = LayoutLMv3Tokenizer.from_pretrained("microsoft/layoutlmv3-base")
         model = LayoutLMv3ForTokenClassification.from_pretrained("microsoft/layoutlmv3-base")
         model.to(device)
         model.eval()
@@ -82,7 +84,8 @@ def test_layoutlm_on_pdf(pdf_path: str):
     page_height = page_data['height']
     
     for element in text_elements[:50]:  # 限制处理前50个文本块
-        text = element.get('text', '').strip()
+        # 尝试两个字段: 'content' (新版) 或 'text' (旧版)
+        text = element.get('content', element.get('text', '')).strip()
         if not text:
             continue
         
@@ -109,13 +112,15 @@ def test_layoutlm_on_pdf(pdf_path: str):
     start = time.time()
     
     try:
-        encoding = processor(
+        # 使用tokenizer直接处理,已经有文本和bbox
+        encoding = tokenizer(
             text=words,
             boxes=boxes,
             return_tensors="pt",
             truncation=True,
             padding="max_length",
-            max_length=512
+            max_length=512,
+            is_split_into_words=True  # 已经分词
         )
         
         for k, v in encoding.items():

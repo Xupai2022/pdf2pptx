@@ -28,6 +28,14 @@ class LayoutAnalyzerV2:
         self.group_tolerance = config.get('group_tolerance', 10)
         self.detect_headers = config.get('detect_headers', True)
         self.detect_footers = config.get('detect_footers', True)
+        
+        # 初始化LayoutLM分析器 (可选)
+        try:
+            from .layoutlm_analyzer import LayoutLMAnalyzer
+            self.layoutlm_analyzer = LayoutLMAnalyzer(config)
+        except Exception as e:
+            logger.warning(f"LayoutLM analyzer not available: {e}")
+            self.layoutlm_analyzer = None
     
     @staticmethod
     def _is_purely_numeric(text: str) -> bool:
@@ -174,6 +182,10 @@ class LayoutAnalyzerV2:
         Returns:
             Dictionary with analyzed layout structure
         """
+        # Step 0: LayoutLM语义增强 (可选,如果启用)
+        if self.layoutlm_analyzer and self.layoutlm_analyzer.enabled:
+            page_data = self.layoutlm_analyzer.enhance_layout_analysis(page_data)
+        
         page_width = page_data.get('width', 0)
         page_height = page_data.get('height', 0)
         elements = page_data.get('elements', [])
