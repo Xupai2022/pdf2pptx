@@ -34,6 +34,10 @@ class TableDetector:
         """
         Detect table regions in a page by analyzing shape grid patterns.
         
+        Supports两种表格检测模式：
+        1. 矩形单元格表格（Rectangle-based tables）：每个cell是完整矩形
+        2. 线框式表格（Line-based tables）：使用线条绘制边框的表格
+        
         Args:
             shapes: List of shape elements from parser
             page: PyMuPDF page object
@@ -45,14 +49,27 @@ class TableDetector:
         if len(shapes) < self.min_table_rows * self.min_table_cols:
             return []
         
+        tables = []
+        
+        # MODE 1: Rectangle-based table detection (existing logic)
         # Find rectangular shapes that could be table cells
         cell_candidates = self._filter_table_cell_candidates(shapes)
         
-        if len(cell_candidates) < self.min_table_rows * self.min_table_cols:
-            return []
+        if len(cell_candidates) >= self.min_table_rows * self.min_table_cols:
+            # Detect grid structures from rectangles
+            rect_tables = self._detect_grid_structures(cell_candidates, page)
+            tables.extend(rect_tables)
+            logger.info(f"Rectangle-based detection found {len(rect_tables)} table(s)")
         
-        # Detect grid structures
-        tables = self._detect_grid_structures(cell_candidates, page)
+        # MODE 2: Line-based table detection (new logic)
+        # Detect tables constructed from line segments
+        line_tables = self._detect_line_based_tables(shapes, page)
+        if line_tables:
+            logger.info(f"Line-based detection found {len(line_tables)} table(s)")
+            tables.extend(line_tables)
+        
+        # Remove overlapping tables (prefer rectangle-based over line-based)
+        tables = self._remove_overlapping_tables(tables)
         
         # Populate cell contents if text_elements provided
         if text_elements:
@@ -199,6 +216,266 @@ class TableDetector:
                    f"(removed {len(candidates) - len(filtered_candidates)} backgrounds)")
         
         return filtered_candidates
+    
+    def _detect_line_based_tables(self, shapes: List[Dict[str, Any]], 
+                                  page: fitz.Page) -> List[Dict[str, Any]]:
+        """
+        Detect tables constructed from line segments (line-based tables).
+        
+        这种表格由水平线和垂直线构成网格框架，矩形仅作为单元格背景填充。
+        常见于报表类PDF，如第5页的行业化季报表格。
+        
+        检测策略：
+        1. 提取所有线条shapes（line type）
+        2. 按方向分类为水平线（行分隔线）和垂直线（列分隔线）
+        3. 检测线条是否形成规则网格（对齐且等间距）
+        4. 从线条交点构建虚拟单元格
+        5. 与矩形背景关联，提取单元格样式
+        
+        Args:
+            shapes: List of all shape elements (including lines and rectangles)
+            page: PyMuPDF page object
+            
+        Returns:
+            List of detected line-based table dictionaries
+        """
+        # Step 1: Extract and classify lines
+        h_lines = []  # Horizontal lines (row separators)
+        v_lines = []  # Vertical lines (column separators)
+        rectangles = []  # Cell backgrounds
+        
+        for shape in shapes:
+            shape_type = shape.get('shape_type', 'rectangle')
+            width = shape.get('width', 0)
+            height = shape.get('height', 0)
+            
+            if shape_type == 'line':
+                # Classify by orientation
+                if width > height:
+                    # Horizontal line
+                    h_lines.append(shape)
+                else:
+                    # Vertical line
+                    v_lines.append(shape)
+            elif shape_type == 'rectangle' and width > 10 and height > 10:
+                # Potential cell background
+                rectangles.append(shape)
+        
+        # Need minimum lines to form a grid
+        if len(h_lines) < 2 or len(v_lines) < 2:
+            logger.debug(f"Insufficient lines for line-based table: {len(h_lines)} h-lines, {len(v_lines)} v-lines")
+            return []
+        
+        logger.debug(f"Line-based detection: {len(h_lines)} h-lines, {len(v_lines)} v-lines, {len(rectangles)} rects")
+        
+        # Step 2: Group lines by position (detect alignment)
+        h_line_groups = self._group_lines_by_position(h_lines, axis='y')
+        v_line_groups = self._group_lines_by_position(v_lines, axis='x')
+        
+        if len(h_line_groups) < 2 or len(v_line_groups) < 2:
+            logger.debug(f"Insufficient line groups: {len(h_line_groups)} h-groups, {len(v_line_groups)} v-groups")
+            return []
+        
+        # Step 3: Validate grid pattern (lines should be regularly spaced)
+        if not self._validate_line_grid_pattern(h_line_groups, v_line_groups):
+            logger.debug("Line pattern does not form a valid table grid")
+            return []
+        
+        # Step 4: Build table grid from line intersections
+        table = self._build_table_from_lines(h_line_groups, v_line_groups, rectangles, page)
+        
+        if table:
+            logger.info(f"Detected line-based table: {table['rows']}x{table['cols']} grid")
+            return [table]
+        
+        return []
+    
+    def _group_lines_by_position(self, lines: List[Dict[str, Any]], axis: str) -> Dict[float, List[Dict[str, Any]]]:
+        """
+        Group lines by their position (Y for horizontal lines, X for vertical lines).
+        
+        Args:
+            lines: List of line shapes
+            axis: 'x' for vertical lines, 'y' for horizontal lines
+            
+        Returns:
+            Dictionary mapping position to list of lines at that position
+        """
+        groups = {}
+        tolerance = self.alignment_tolerance
+        
+        for line in lines:
+            if axis == 'y':
+                # Horizontal lines: group by Y coordinate (use midpoint)
+                pos = (line['y'] + line['y2']) / 2
+            else:
+                # Vertical lines: group by X coordinate (use midpoint)
+                pos = (line['x'] + line['x2']) / 2
+            
+            # Round to tolerance
+            pos_key = round(pos / tolerance) * tolerance
+            
+            if pos_key not in groups:
+                groups[pos_key] = []
+            groups[pos_key].append(line)
+        
+        return groups
+    
+    def _validate_line_grid_pattern(self, h_line_groups: Dict, v_line_groups: Dict) -> bool:
+        """
+        Validate that lines form a regular grid pattern (not random lines).
+        
+        检查条件：
+        1. 每个位置的线条应该跨越相似的范围（长度一致性）
+        2. 线条之间的间距应该相对规则（不能间距过大或过小）
+        3. 至少形成2x2的网格
+        
+        Args:
+            h_line_groups: Horizontal line groups by Y position
+            v_line_groups: Vertical line groups by X position
+            
+        Returns:
+            True if lines form a valid table grid
+        """
+        # Check minimum grid size
+        if len(h_line_groups) < 2 or len(v_line_groups) < 2:
+            return False
+        
+        # Check if lines span across sufficient range
+        # Horizontal lines should span multiple columns
+        h_spans = []
+        for pos, lines_at_pos in h_line_groups.items():
+            for line in lines_at_pos:
+                span = line['width']
+                h_spans.append(span)
+        
+        # Vertical lines should span multiple rows
+        v_spans = []
+        for pos, lines_at_pos in v_line_groups.items():
+            for line in lines_at_pos:
+                span = line['height']
+                v_spans.append(span)
+        
+        # Lines should have reasonable spans (> 20pt to cross at least one cell)
+        avg_h_span = sum(h_spans) / len(h_spans) if h_spans else 0
+        avg_v_span = sum(v_spans) / len(v_spans) if v_spans else 0
+        
+        if avg_h_span < 20 or avg_v_span < 20:
+            logger.debug(f"Line spans too small: h_span={avg_h_span:.1f}, v_span={avg_v_span:.1f}")
+            return False
+        
+        # Check spacing regularity (spacing should not vary wildly)
+        sorted_h_positions = sorted(h_line_groups.keys())
+        sorted_v_positions = sorted(v_line_groups.keys())
+        
+        # Calculate row heights (spacing between horizontal lines)
+        row_heights = [sorted_h_positions[i+1] - sorted_h_positions[i] 
+                      for i in range(len(sorted_h_positions) - 1)]
+        
+        # Calculate column widths (spacing between vertical lines)
+        col_widths = [sorted_v_positions[i+1] - sorted_v_positions[i] 
+                     for i in range(len(sorted_v_positions) - 1)]
+        
+        # Row heights should be reasonable (10pt - 150pt per row)
+        if any(h < 10 or h > 150 for h in row_heights):
+            logger.debug(f"Irregular row heights: {row_heights}")
+            return False
+        
+        # Column widths should be reasonable (20pt - 600pt per column)
+        if any(w < 20 or w > 600 for w in col_widths):
+            logger.debug(f"Irregular column widths: {col_widths}")
+            return False
+        
+        logger.debug(f"Valid line grid: {len(sorted_h_positions)} rows, {len(sorted_v_positions)} cols")
+        return True
+    
+    def _build_table_from_lines(self, h_line_groups: Dict, v_line_groups: Dict,
+                                rectangles: List[Dict[str, Any]], 
+                                page: fitz.Page) -> Optional[Dict[str, Any]]:
+        """
+        Build table structure from line intersections.
+        
+        将线条的交点转换为单元格边界，创建虚拟单元格grid。
+        
+        Args:
+            h_line_groups: Horizontal line groups (row separators)
+            v_line_groups: Vertical line groups (column separators)
+            rectangles: Rectangle shapes (cell backgrounds)
+            page: PyMuPDF page object
+            
+        Returns:
+            Table dictionary or None
+        """
+        # Get sorted positions
+        row_positions = sorted(h_line_groups.keys())
+        col_positions = sorted(v_line_groups.keys())
+        
+        # Build cell grid
+        cells = []
+        rows = len(row_positions) - 1
+        cols = len(col_positions) - 1
+        
+        for i in range(rows):
+            for j in range(cols):
+                # Cell boundaries
+                y_top = row_positions[i]
+                y_bottom = row_positions[i + 1]
+                x_left = col_positions[j]
+                x_right = col_positions[j + 1]
+                
+                # Create cell
+                cell = {
+                    'x': x_left,
+                    'y': y_top,
+                    'x2': x_right,
+                    'y2': y_bottom,
+                    'width': x_right - x_left,
+                    'height': y_bottom - y_top,
+                    'pdf_index': i * cols + j  # Sequential index
+                }
+                
+                # Try to find matching rectangle background
+                for rect in rectangles:
+                    # Check if rectangle overlaps with this cell (within tolerance)
+                    tolerance = 5.0
+                    x_overlap = (abs(rect['x'] - x_left) < tolerance and 
+                                abs(rect['x2'] - x_right) < tolerance)
+                    y_overlap = (abs(rect['y'] - y_top) < tolerance and 
+                                abs(rect['y2'] - y_bottom) < tolerance)
+                    
+                    if x_overlap and y_overlap:
+                        # This rectangle is the background for this cell
+                        cell['fill_color'] = rect.get('fill_color')
+                        cell['stroke_color'] = rect.get('stroke_color')
+                        cell['stroke_width'] = rect.get('stroke_width', 0.5)
+                        break
+                
+                # If no background found, use default styling
+                if 'fill_color' not in cell:
+                    cell['fill_color'] = None  # No fill
+                    cell['stroke_color'] = '#000000'  # Black border
+                    cell['stroke_width'] = 0.5
+                
+                cells.append(cell)
+        
+        # Calculate table bounding box
+        bbox = (
+            col_positions[0],
+            row_positions[0],
+            col_positions[-1],
+            row_positions[-1]
+        )
+        
+        table = {
+            'bbox': bbox,
+            'rows': rows,
+            'cols': cols,
+            'cells': cells,
+            'type': 'table',
+            'detection_mode': 'line-based'  # Mark as line-based for debugging
+        }
+        
+        return table
     
     def _detect_grid_structures(self, cells: List[Dict[str, Any]], 
                                page: fitz.Page) -> List[Dict[str, Any]]:
