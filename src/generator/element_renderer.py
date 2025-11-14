@@ -714,9 +714,25 @@ class ElementRenderer:
                         font_family = first_text.get('font_name')
                         is_bold_in_pdf = first_text.get('is_bold', False)
                         
+                        # CRITICAL ENHANCEMENT: Apply text alignment detected from PDF
+                        # Read alignment from cell_data (detected by table_detector._populate_table_cells)
+                        text_alignment = cell_data.get('text_alignment', 'left')
+                        
                         # Apply formatting to ALL paragraphs and runs in the cell
                         # This ensures multi-line text has consistent formatting
                         for para in cell.text_frame.paragraphs:
+                            # Apply text alignment to paragraph
+                            from pptx.enum.text import PP_ALIGN
+                            if text_alignment == 'center':
+                                para.alignment = PP_ALIGN.CENTER
+                                logger.debug(f"Applied CENTER alignment to paragraph in cell '{cell.text[:20]}'")
+                            elif text_alignment == 'right':
+                                para.alignment = PP_ALIGN.RIGHT
+                                logger.debug(f"Applied RIGHT alignment to paragraph in cell '{cell.text[:20]}'")
+                            elif text_alignment == 'left':
+                                para.alignment = PP_ALIGN.LEFT
+                                logger.debug(f"Applied LEFT alignment to paragraph in cell '{cell.text[:20]}'")
+                            
                             if not para.runs:
                                 continue
                             
@@ -738,7 +754,8 @@ class ElementRenderer:
                                 run.font.bold = is_bold_in_pdf
                         
                         logger.debug(f"Applied formatting to {len(cell.text_frame.paragraphs)} paragraph(s) "
-                                   f"in cell '{cell.text[:20]}': {font_family}, {font_size}pt, bold={is_bold_in_pdf}")
+                                   f"in cell '{cell.text[:20]}': {font_family}, {font_size}pt, bold={is_bold_in_pdf}, "
+                                   f"align={text_alignment}")
             
             # Apply cell merges after all cells are populated
             # Use the _detect_cell_merges method to identify merge regions from grid data

@@ -82,6 +82,75 @@ class TableDetector:
         
         return tables
     
+    def _filter_shapes_outside_charts(self, shapes: List[Dict[str, Any]], 
+                                       chart_regions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filter out shapes that overlap significantly with chart regions.
+        
+        This prevents chart elements (pie slices, bar segments, legend boxes, lines)
+        from being mistakenly identified as table cells.
+        
+        CRITICAL: For lines, use CENTER POINT overlap check instead of area overlap
+        because lines have very small area but can span across regions.
+        
+        Args:
+            shapes: List of shape elements
+            chart_regions: List of chart region dictionaries with 'bbox' key
+            
+        Returns:
+            Filtered list of shapes outside chart regions
+        """
+        if not chart_regions:
+            return shapes
+        
+        filtered = []
+        
+        for shape in shapes:
+            shape_bbox = (shape['x'], shape['y'], shape['x2'], shape['y2'])
+            shape_type = shape.get('shape_type', 'rectangle')
+            
+            # Calculate shape center point
+            shape_center_x = (shape_bbox[0] + shape_bbox[2]) / 2
+            shape_center_y = (shape_bbox[1] + shape_bbox[3]) / 2
+            
+            # Check if shape overlaps significantly with any chart
+            is_in_chart = False
+            for chart in chart_regions:
+                chart_bbox = chart.get('bbox')
+                if not chart_bbox:
+                    continue
+                
+                # CRITICAL: Different strategies for lines vs rectangles
+                # Lines: Check if center point is in chart region
+                # Rectangles: Check if > 50% area overlaps with chart
+                
+                if shape_type == 'line':
+                    # For lines, check if center point is within chart bbox
+                    if (chart_bbox[0] <= shape_center_x <= chart_bbox[2] and
+                        chart_bbox[1] <= shape_center_y <= chart_bbox[3]):
+                        is_in_chart = True
+                        logger.debug(f"Filtered line in chart: center=({shape_center_x:.1f}, {shape_center_y:.1f}) in chart bbox={chart_bbox}")
+                        break
+                else:
+                    # For rectangles, check area overlap
+                    overlap_x = max(0, min(shape_bbox[2], chart_bbox[2]) - max(shape_bbox[0], chart_bbox[0]))
+                    overlap_y = max(0, min(shape_bbox[3], chart_bbox[3]) - max(shape_bbox[1], chart_bbox[1]))
+                    overlap_area = overlap_x * overlap_y
+                    
+                    # Calculate shape area
+                    shape_area = (shape_bbox[2] - shape_bbox[0]) * (shape_bbox[3] - shape_bbox[1])
+                    
+                    # If > 50% of shape overlaps with chart, exclude it
+                    if shape_area > 0 and overlap_area > shape_area * 0.5:
+                        is_in_chart = True
+                        logger.debug(f"Filtered shape in chart: bbox={shape_bbox}, overlap={overlap_area:.1f}/{shape_area:.1f}")
+                        break
+            
+            if not is_in_chart:
+                filtered.append(shape)
+        
+        return filtered
+    
     def _filter_table_cell_candidates(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Filter shapes that could be table cells.
@@ -285,6 +354,34 @@ class TableDetector:
         table = self._build_table_from_lines(h_line_groups, v_line_groups, rectangles, page)
         
         if table:
+            # CRITICAL VALIDATION: Check if table columns form a compact group
+            # Reject tables where columns are scattered across disconnected regions
+            # Example: Page 27 has left chart (X=132-435) + right table (X=462-920)
+            # These should NOT be merged into one table
+            
+            cells = table.get('cells', [])
+            if cells:
+                # Get all unique column X positions
+                col_x_positions = sorted(set(c['x'] for c in cells))
+                
+                # Calculate gaps between consecutive columns
+                if len(col_x_positions) >= 2:
+                    gaps = [col_x_positions[i+1] - col_x_positions[i] 
+                           for i in range(len(col_x_positions) - 1)]
+                    
+                    # If there's a gap > 20pt between columns, it's likely two separate regions
+                    # CRITICAL: This threshold should be smaller than typical column spacing
+                    # but larger than typical cell borders (which are < 5pt)
+                    max_gap = max(gaps) if gaps else 0
+                    median_gap = sorted(gaps)[len(gaps)//2] if gaps else 0
+                    
+                    # Reject if max gap is > 3x median gap AND > 20pt (indicates discontinuity)
+                    if max_gap > 20 and (median_gap == 0 or max_gap > median_gap * 3):
+                        logger.info(f"Rejected line-based table: columns have large gap "
+                                   f"(max_gap={max_gap:.1f}pt, median={median_gap:.1f}pt), "
+                                   f"likely spans disconnected regions")
+                        return []
+            
             logger.info(f"Detected line-based table: {table['rows']}x{table['cols']} grid")
             return [table]
         
@@ -397,6 +494,10 @@ class TableDetector:
         
         将线条的交点转换为单元格边界，创建虚拟单元格grid。
         
+        CRITICAL FIX: Check for horizontally separated regions before building table
+        Example: Page 27 has left chart (X=132-435) + right table (X=462-920)
+        These should NOT be merged into one table
+        
         Args:
             h_line_groups: Horizontal line groups (row separators)
             v_line_groups: Vertical line groups (column separators)
@@ -409,6 +510,21 @@ class TableDetector:
         # Get sorted positions
         row_positions = sorted(h_line_groups.keys())
         col_positions = sorted(v_line_groups.keys())
+        
+        # CRITICAL CHECK: Detect horizontal gaps in column positions
+        # If there's a large gap (> 50pt) between columns, it indicates
+        # two separate regions that should NOT be merged into one table
+        if len(col_positions) >= 2:
+            gaps = [col_positions[i+1] - col_positions[i] 
+                   for i in range(len(col_positions) - 1)]
+            max_gap = max(gaps) if gaps else 0
+            
+            # If max gap > 50pt, reject this table (likely spans disconnected regions)
+            if max_gap > 50:
+                logger.info(f"Rejected line-based table: columns have large gap "
+                           f"(max_gap={max_gap:.1f}pt), likely spans disconnected regions "
+                           f"(e.g., chart + table)")
+                return None
         
         # Build cell grid
         cells = []
@@ -1716,6 +1832,54 @@ class TableDetector:
                 # Combine text content
                 combined_text = ' '.join(t.get('content', t.get('text', '')) for t in cell_texts)
                 
+                # CRITICAL ENHANCEMENT: Detect text alignment within cell
+                # Analyze text position relative to cell center for intelligent alignment detection
+                text_alignment = 'left'  # Default alignment
+                if cell_texts:
+                    # Calculate cell center
+                    cell_center_x = (cell['x'] + cell['x2']) / 2
+                    cell_width = cell['width']
+                    
+                    # Calculate text bounding box
+                    text_x_min = min(t['x'] for t in cell_texts)
+                    text_x_max = max(t.get('x2', t['x'] + 50) for t in cell_texts)  # Estimate x2 if not available
+                    text_center_x = (text_x_min + text_x_max) / 2
+                    
+                    # Calculate offset from cell center
+                    center_offset = abs(text_center_x - cell_center_x)
+                    
+                    # Alignment detection heuristics:
+                    # 1. If text center is within 8% of cell width from cell center -> CENTER aligned
+                    # 2. If text left edge is close to cell left (< 5pt) -> LEFT aligned
+                    # 3. If text right edge is close to cell right (< 5pt) -> RIGHT aligned
+                    # 4. Otherwise, check which side text is closer to
+                    
+                    left_margin = text_x_min - cell['x']
+                    right_margin = cell['x2'] - text_x_max
+                    
+                    if center_offset < cell_width * 0.08:
+                        # Text is centered within cell
+                        text_alignment = 'center'
+                        logger.debug(f"Cell text centered: offset={center_offset:.1f}pt < {cell_width*0.08:.1f}pt (8% of width)")
+                    elif left_margin < 5:
+                        # Text hugs left edge
+                        text_alignment = 'left'
+                        logger.debug(f"Cell text left-aligned: left_margin={left_margin:.1f}pt")
+                    elif right_margin < 5:
+                        # Text hugs right edge
+                        text_alignment = 'right'
+                        logger.debug(f"Cell text right-aligned: right_margin={right_margin:.1f}pt")
+                    elif left_margin < right_margin * 0.7:
+                        # Text is closer to left
+                        text_alignment = 'left'
+                    elif right_margin < left_margin * 0.7:
+                        # Text is closer to right
+                        text_alignment = 'right'
+                    else:
+                        # Margins are balanced, likely centered
+                        text_alignment = 'center'
+                        logger.debug(f"Cell text centered (balanced margins): left={left_margin:.1f}pt, right={right_margin:.1f}pt")
+                
                 # Create cell info
                 # CRITICAL: Preserve PDF cell colors exactly as they are
                 # Do NOT remove white backgrounds - white is a valid cell color in PDF
@@ -1762,6 +1926,8 @@ class TableDetector:
                     'stroke_width': cell_stroke_width,  # Use actual PDF stroke width
                     # Store text elements for style extraction
                     'text_elements': cell_texts,
+                    # Store text alignment detected from PDF
+                    'text_alignment': text_alignment,
                     # Store minimal margins - PowerPoint adds internal padding automatically
                     'margin_top': margin_top,
                     'margin_bottom': margin_bottom,

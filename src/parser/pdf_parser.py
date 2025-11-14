@@ -307,10 +307,13 @@ class PDFParser:
         # Add filtered text elements to page data (AFTER gradient detection and filtering)
         page_data['elements'].extend(filtered_text_elements)
         
-        # CRITICAL FIX: Detect table regions BEFORE chart regions
-        # Tables have priority over charts to avoid misidentification
+        # CRITICAL FIX: Detect TABLE regions FIRST (they have higher priority)
+        # Then detect chart regions from NON-TABLE shapes only
+        # This prevents tables from being misidentified as charts
         # Pass text elements to populate table cell contents
-        table_regions = self.table_detector.detect_tables(drawing_elements, page, filtered_text_elements)
+        table_regions = self.table_detector.detect_tables(
+            drawing_elements, page, filtered_text_elements
+        )
         
         # Mark shapes and texts in table regions for exclusion from individual rendering
         table_shape_ids = set()

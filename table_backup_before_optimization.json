@@ -1,0 +1,85 @@
+{
+  "安全运营月报": {
+    "page_8": [
+      {
+        "rows": 11,
+        "cols": 3,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      }
+    ],
+    "page_9": [
+      {
+        "rows": 7,
+        "cols": 3,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      }
+    ],
+    "page_12": [
+      {
+        "rows": 9,
+        "cols": 5,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      }
+    ]
+  },
+  "season_report_del": {
+    "page_7": [
+      {
+        "rows": 6,
+        "cols": 4,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      }
+    ],
+    "page_9": [
+      {
+        "rows": 3,
+        "cols": 5,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      }
+    ],
+    "page_10": [
+      {
+        "rows": 7,
+        "cols": 3,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      },
+      {
+        "rows": 5,
+        "cols": 3,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      }
+    ],
+    "page_13": [
+      {
+        "rows": 7,
+        "cols": 5,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      }
+    ],
+    "page_16": [
+      {
+        "rows": 7,
+        "cols": 4,
+        "bbox": null,
+        "cells_count": 0,
+        "detection_mode": "rectangle-based"
+      }
+    ]
+  }
+}
