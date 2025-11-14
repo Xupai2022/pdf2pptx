@@ -12,8 +12,10 @@ from PIL import Image
 from .border_detector import BorderDetector
 from .shape_merger import ShapeMerger
 from .chart_detector import ChartDetector
+from .table_detector import TableDetector
 from .text_image_overlap_detector import TextImageOverlapDetector
 from .icon_font_detector import IconFontDetector
+from .gradient_detector import GradientDetector
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +41,14 @@ class PDFParser:
         self.max_text_size = config.get('max_text_size', 72)
         self.doc = None
         
-        # Initialize border detector, shape merger, chart detector, text overlap detector, and icon detector
+        # Initialize border detector, shape merger, chart detector, table detector, text overlap detector, icon detector, and gradient detector
         self.border_detector = BorderDetector(config)
         self.shape_merger = ShapeMerger(config)
         self.chart_detector = ChartDetector(config)
+        self.table_detector = TableDetector(config)
         self.text_overlap_detector = TextImageOverlapDetector(overlap_threshold=0.5)
         self.icon_detector = IconFontDetector(config)
+        self.gradient_detector = GradientDetector(config)
         
     def open(self, pdf_path: str) -> bool:
         """
@@ -92,9 +96,128 @@ class PDFParser:
         rect = page.rect
         return (rect.width, rect.height)
     
+    def _generate_page_background_without_text(self, page: fitz.Page, page_num: int) -> Optional[Dict[str, Any]]:
+        """
+        Generate a full-page background image without text for the given page.
+        This creates a complete page render excluding text elements.
+        
+        CRITICAL FIX: Render full page then remove text pixels using transparency.
+        Instead of masking text with opaque rectangles (which leave visible artifacts),
+        we render the complete page first, then make text pixels transparent.
+        This preserves ALL original PDF backgrounds, patterns, and styles perfectly.
+        
+        Strategy:
+        1. Render the full page at high resolution (includes everything)
+        2. Extract text bounding boxes to identify text regions
+        3. Make text pixels transparent by setting alpha channel to 0
+        4. Result: Complete original background with transparent "holes" where text was
+        
+        This approach avoids any visible artifacts because transparency is truly invisible,
+        while preserving all original PDF visual elements (backgrounds, patterns, shapes).
+        
+        Args:
+            page: PyMuPDF page object
+            page_num: Page number for identification
+            
+        Returns:
+            Image element dictionary with z_index=-1000, or None if generation fails
+        """
+        try:
+            rect = page.rect
+            
+            # Step 1: Extract text bounding boxes
+            text_bboxes = []
+            text_dict = page.get_text("dict")
+            for block in text_dict.get("blocks", []):
+                if block.get("type") == 0:  # Text block
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            bbox = span.get("bbox", [0, 0, 0, 0])
+                            # Only include reasonable-sized text (filter noise)
+                            if bbox[2] - bbox[0] > 2 and bbox[3] - bbox[1] > 2:
+                                text_bboxes.append(bbox)
+            
+            logger.info(f"Page {page_num}: Found {len(text_bboxes)} text regions to make transparent")
+            
+            # Step 2: Render the full page at high resolution
+            zoom = 2.0  # 2x for ~144 DPI from 72 DPI
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=True)
+            
+            # Step 3: Convert to PIL Image and make text regions transparent
+            from PIL import Image, ImageDraw
+            
+            # Convert pixmap to PIL Image
+            img = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
+            
+            # Create an alpha mask for text regions
+            # We'll set alpha to 0 (fully transparent) for text pixels
+            alpha_mask = img.getchannel('A')  # Get current alpha channel
+            draw = ImageDraw.Draw(alpha_mask)
+            
+            # Make each text region fully transparent
+            for bbox in text_bboxes:
+                # Scale bbox coordinates by zoom factor
+                x0, y0, x2, y2 = bbox
+                x0_scaled = int(x0 * zoom)
+                y0_scaled = int(y0 * zoom)
+                x2_scaled = int(x2 * zoom)
+                y2_scaled = int(y2 * zoom)
+                
+                # Draw a black rectangle in alpha channel (0 = transparent)
+                # Add a small padding (2px) to ensure complete coverage
+                padding = 2
+                draw.rectangle(
+                    [x0_scaled - padding, y0_scaled - padding, 
+                     x2_scaled + padding, y2_scaled + padding],
+                    fill=0  # 0 = fully transparent
+                )
+            
+            # Apply the modified alpha mask back to the image
+            img.putalpha(alpha_mask)
+            
+            # Step 4: Convert back to PNG bytes
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            image_bytes = img_bytes.getvalue()
+            
+            # Create image element with lowest z-index to ensure it's at the bottom
+            background_element = {
+                'type': 'image',
+                'image_data': image_bytes,
+                'image_format': 'png',
+                'width_px': pix.width,
+                'height_px': pix.height,
+                'x': rect.x0,
+                'y': rect.y0,
+                'x2': rect.x1,
+                'y2': rect.y1,
+                'width': rect.width,
+                'height': rect.height,
+                'image_id': f"page{page_num}_full_background",
+                'is_background': True,
+                'z_index': -1000  # Ensure this is rendered at the bottom
+            }
+            
+            logger.info(f"Generated text-free full-page background for page {page_num} "
+                       f"(size: {pix.width}x{pix.height}px, {len(image_bytes)} bytes) "
+                       f"by making {len(text_bboxes)} text regions transparent")
+            
+            return background_element
+            
+        except Exception as e:
+            logger.error(f"Failed to generate page background for page {page_num}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+
     def extract_page_elements(self, page_num: int) -> Dict[str, Any]:
         """
         Extract all elements from a specific page.
+        
+        For first and last pages, a special full-page background image is created
+        (without text) and placed at z-index -1000 to serve as the bottom layer,
+        while text elements are placed on top for editability.
         
         Args:
             page_num: Page number (0-indexed)
@@ -116,6 +239,22 @@ class PDFParser:
             'elements': []
         }
         
+        # Determine if this is first or last page
+        total_pages = len(self.doc)
+        is_first_page = (page_num == 0)
+        is_last_page = (page_num == total_pages - 1)
+        
+        # For first and last pages, generate full-page background image
+        if is_first_page or is_last_page:
+            background_elem = self._generate_page_background_without_text(page, page_num)
+            if background_elem:
+                # Add background element with lowest z-index
+                page_data['elements'].append(background_elem)
+                logger.info(f"Page {page_num + 1}: Added full-page background layer "
+                           f"({'first' if is_first_page else 'last'} page)")
+            else:
+                logger.warning(f"Page {page_num + 1}: Failed to generate background layer")
+        
         # Extract ExtGState opacity mapping for this page
         opacity_map = self._extract_opacity_map(page)
         
@@ -134,21 +273,105 @@ class PDFParser:
         filtered_text_elements = [
             elem for i, elem in enumerate(text_elements) if i not in icon_indices
         ]
-        page_data['elements'].extend(filtered_text_elements)
         
         if icon_indices:
             logger.info(f"Page {page_num}: Filtered out {len(icon_indices)} icon font text element(s)")
         
-        # Extract images (pass text elements for overlap detection)
+        # CRITICAL FIX: Extract shapes/drawings FIRST to detect gradient patterns
+        # This prevents gradient XObjects from being extracted twice
+        # IMPORTANT: Pass filtered_text_elements for page number detection in gradients
+        drawing_elements, gradient_images = self._extract_drawings(page, opacity_map, page_num, filtered_text_elements)
+        
+        # Add gradient images to page elements (they should be rendered on bottom layer)
+        if gradient_images:
+            page_data['elements'].extend(gradient_images)
+            logger.info(f"Page {page_num}: Detected and extracted {len(gradient_images)} gradient pattern(s) as images")
+        
+        # Extract images (pass text elements for overlap detection and gradient images to avoid duplicates)
         if self.extract_images:
-            image_elements = self._extract_images(page, page_num, filtered_text_elements)
+            image_elements = self._extract_images(page, page_num, filtered_text_elements, gradient_images)
             page_data['elements'].extend(image_elements)
+            
+            # CRITICAL: Filter out page numbers that are within gradient regions
+            # This prevents page number duplication when gradients are rendered as images
+            original_count = len(filtered_text_elements)
+            filtered_text_elements = [
+                elem for elem in filtered_text_elements
+                if not self.gradient_detector.should_exclude_text_in_gradient(elem, gradient_images)
+            ]
+            excluded_count = original_count - len(filtered_text_elements)
+            if excluded_count > 0:
+                logger.info(f"Page {page_num}: Excluded {excluded_count} page number text element(s) "
+                           f"from gradient region(s) to prevent duplication")
         
-        # Extract shapes/drawings with opacity information
-        drawing_elements = self._extract_drawings(page, opacity_map)
+        # Add filtered text elements to page data (AFTER gradient detection and filtering)
+        page_data['elements'].extend(filtered_text_elements)
         
-        # Detect chart regions before adding shapes to elements
-        chart_regions = self.chart_detector.detect_chart_regions(page, drawing_elements)
+        # CRITICAL FIX: Detect table regions BEFORE chart regions
+        # Tables have priority over charts to avoid misidentification
+        # Pass text elements to populate table cell contents
+        table_regions = self.table_detector.detect_tables(drawing_elements, page, filtered_text_elements)
+        
+        # Mark shapes and texts in table regions for exclusion from individual rendering
+        table_shape_ids = set()
+        table_text_ids = set()
+        
+        for table_region in table_regions:
+            table_bbox = table_region['bbox']
+            
+            # CRITICAL FIX: Do NOT extend bbox upward to include "header" text above table
+            # The table's first row IS the header row - it's already part of the table cells
+            # Text above the table (like explanatory paragraphs) should render as separate text boxes
+            # Extending the bbox causes two major issues:
+            # 1. Paragraph text above table gets incorrectly marked as table content (disappears)
+            # 2. Table cell text gets excluded from text_elements, making cells empty
+            #
+            # Solution: Use ONLY the actual table bbox without any upward extension
+            # Add small horizontal margins to catch cell borders
+            extended_bbox = (
+                table_bbox[0] - 5,   # Left with small margin for borders
+                table_bbox[1],       # NO upward extension - use actual table top
+                table_bbox[2] + 5,   # Right with small margin for borders  
+                table_bbox[3]        # Bottom unchanged
+            )
+            
+            # Mark shapes in table region (borders, cell backgrounds)
+            for shape in drawing_elements:
+                shape_center_x = (shape['x'] + shape['x2']) / 2
+                shape_center_y = (shape['y'] + shape['y2']) / 2
+                if (extended_bbox[0] <= shape_center_x <= extended_bbox[2] and
+                    extended_bbox[1] <= shape_center_y <= extended_bbox[3]):
+                    table_shape_ids.add(id(shape))
+            
+            # Mark texts in table region (use actual bbox, no extension)
+            # This ensures table cell text is available for _populate_table_cells
+            for text_elem in filtered_text_elements:
+                tx, ty = text_elem['x'], text_elem['y']
+                if (extended_bbox[0] <= tx <= extended_bbox[2] and 
+                    extended_bbox[1] <= ty <= extended_bbox[3]):
+                    table_text_ids.add(id(text_elem))
+        
+        # Add table elements to page data (as complete table objects)
+        for table_region in table_regions:
+            table_elem = {
+                'type': 'table',
+                'x': table_region['bbox'][0],
+                'y': table_region['bbox'][1],
+                'x2': table_region['bbox'][2],
+                'y2': table_region['bbox'][3],
+                'width': table_region['bbox'][2] - table_region['bbox'][0],
+                'height': table_region['bbox'][3] - table_region['bbox'][1],
+                'grid': table_region.get('grid', []),
+                'rows': table_region.get('num_rows', table_region.get('rows', 0)),
+                'cols': table_region.get('num_cols', table_region.get('cols', 0)),
+                'col_widths': table_region.get('col_widths', []),  # Preserve column widths from table detector
+                'row_heights': table_region.get('row_heights', [])  # Preserve row heights from table detector
+            }
+            page_data['elements'].append(table_elem)
+        
+        # Detect chart regions from non-table shapes only
+        non_table_shapes = [shape for shape in drawing_elements if id(shape) not in table_shape_ids]
+        chart_regions = self.chart_detector.detect_chart_regions(page, non_table_shapes)
         
         # Convert chart regions to high-resolution images
         chart_shape_ids = set()
@@ -196,23 +419,37 @@ class PDFParser:
                     chart_bbox[1] <= shape_center_y <= chart_bbox[3]):
                     chart_shape_ids.add(id(shape))
         
-        # Filter non-chart shapes to remove text decoration shapes
-        non_chart_shapes = [shape for shape in drawing_elements if id(shape) not in chart_shape_ids]
+        # Filter non-chart and non-table shapes to remove text decoration shapes
+        # Combine both table and chart shape IDs for exclusion
+        excluded_shape_ids = table_shape_ids | chart_shape_ids
+        non_chart_table_shapes = [shape for shape in drawing_elements if id(shape) not in excluded_shape_ids]
         
         # CRITICAL: Filter out shapes that are text decorations (backgrounds/highlights)
         # These shapes appear as unwanted rectangles in PowerPoint
+        # Only filter shapes that are NOT in tables or charts
+        non_table_texts_for_filtering = [t for t in filtered_text_elements if id(t) not in table_text_ids]
+        
         filtered_shapes = self.text_overlap_detector.filter_text_decoration_shapes(
-            non_chart_shapes, filtered_text_elements
+            non_chart_table_shapes, non_table_texts_for_filtering
         )
         
-        # Add filtered shapes to elements
+        # Add filtered shapes to elements (tables and charts already added)
         page_data['elements'].extend(filtered_shapes)
         
-        # Filter out text elements that overlap with chart images
-        if chart_regions:
-            page_data['elements'] = self.text_overlap_detector.filter_overlapping_texts(page_data['elements'])
+        # Filter out text elements that overlap with chart images (but NOT table text)
+        # Table texts are already integrated into table objects, so remove them from page_data
+        if chart_regions or table_regions:
+            # Remove table texts from page_data (they're now in table objects)
+            page_data['elements'] = [
+                elem for elem in page_data['elements']
+                if elem['type'] != 'text' or id(elem) not in table_text_ids
+            ]
+            # Filter overlapping texts with charts
+            if chart_regions:
+                page_data['elements'] = self.text_overlap_detector.filter_overlapping_texts(page_data['elements'])
         
-        logger.info(f"Page {page_num}: Extracted {len(page_data['elements'])} elements ({len(chart_regions)} charts rendered as images)")
+        logger.info(f"Page {page_num}: Extracted {len(page_data['elements'])} elements "
+                   f"({len(table_regions)} tables, {len(chart_regions)} charts rendered as images)")
         
         return page_data
     
@@ -245,7 +482,11 @@ class PDFParser:
                             continue
                         
                         bbox = span.get("bbox", [0, 0, 0, 0])
-                        text = span.get("text", "").strip()
+                        text = span.get("text", "")
+                        
+                        # Only strip leading/trailing newlines and tabs, preserve spaces
+                        # Spaces at boundaries are important for text merging (e.g., "2.3.1 " + "text")
+                        text = text.strip('\n\r\t')
                         
                         if not text:
                             continue
@@ -325,14 +566,25 @@ class PDFParser:
         
         return text_elements
     
-    def _extract_images(self, page: fitz.Page, page_num: int, text_elements: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def _extract_images(self, page: fitz.Page, page_num: int, text_elements: List[Dict[str, Any]] = None, gradient_images: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
-        Extract images from the page with smart overlap detection for rerendering.
+        Extract embedded images (image XObjects) directly from PDF without cropping.
+        
+        CRITICAL PRINCIPLE:
+        - Embedded images (XObjects) NEVER contain text - text is a separate PDF layer
+        - Therefore, we should NEVER crop embedded images to avoid text overlap
+        - Only when RE-RENDERING (taking a screenshot) do we need to worry about text
+        - For decorative patterns, logos, icons, we always use the original embedded image
+        
+        CRITICAL FIX:
+        - Skip images that have already been extracted as gradient patterns
+        - This prevents duplicate extraction of the same XObject
         
         Args:
             page: PyMuPDF page object
             page_num: Page number for naming
-            text_elements: Optional list of already-extracted text elements for overlap detection
+            text_elements: Optional list of text elements (used only for re-render decisions)
+            gradient_images: Optional list of gradient images already extracted (to avoid duplicates)
             
         Returns:
             List of image element dictionaries
@@ -340,13 +592,44 @@ class PDFParser:
         image_elements = []
         image_list = page.get_images(full=True)
         
-        # If text_elements not provided, extract them for overlap detection
+        # Text elements are only needed for re-render overlap detection
         if text_elements is None:
             text_elements = []
+        
+        # Build a set of xrefs that are already extracted as gradients
+        gradient_xrefs = set()
+        if gradient_images:
+            for grad_img in gradient_images:
+                # Try to find the xref for this gradient image
+                # We'll check by position to identify which xref was used
+                for img_info in image_list:
+                    xref = img_info[0]
+                    image_rects = page.get_image_rects(xref)
+                    for img_rect in image_rects:
+                        # Check if this rect matches the gradient image position
+                        grad_x = grad_img.get('x', 0)
+                        grad_y = grad_img.get('y', 0)
+                        grad_x2 = grad_img.get('x2', 0)
+                        grad_y2 = grad_img.get('y2', 0)
+                        
+                        tolerance = 1.0
+                        if (abs(img_rect.x0 - grad_x) < tolerance and
+                            abs(img_rect.y0 - grad_y) < tolerance and
+                            abs(img_rect.x1 - grad_x2) < tolerance and
+                            abs(img_rect.y1 - grad_y2) < tolerance):
+                            gradient_xrefs.add(xref)
+                            logger.debug(f"Page {page_num}: Marked xref {xref} as gradient (skip in normal image extraction)")
+                            break
         
         for img_index, img_info in enumerate(image_list):
             try:
                 xref = img_info[0]
+                
+                # CRITICAL FIX: Skip images that are already extracted as gradients
+                if xref in gradient_xrefs:
+                    logger.debug(f"Page {page_num}: Skipping xref {xref} - already extracted as gradient")
+                    continue
+                
                 base_image = self.doc.extract_image(xref)
                 
                 if not base_image:
@@ -365,6 +648,32 @@ class PDFParser:
                 if image_rects:
                     rect = image_rects[0]  # Use first occurrence
                     
+                    # IMPORTANT: Keep all embedded images, including full-page backgrounds
+                    # Some full-page backgrounds contain important visual elements (e.g., shield patterns)
+                    # The header/footer screenshot mechanism that was causing issues has been removed
+                    # So we can now safely keep all embedded images as-is
+                    page_area = page.rect.width * page.rect.height
+                    image_area = rect.width * rect.height
+                    area_ratio = image_area / page_area if page_area > 0 else 0
+                    
+                    # CRITICAL FIX: Full-page background images (>80% area) must be extracted completely
+                    # These often contain important decorative elements like shield patterns, watermarks, etc.
+                    # They should NOT be shrunk or cropped, even if text overlaps
+                    # They will be rendered on the bottommost layer in PPT, so text will appear on top
+                    is_full_page_background = area_ratio > 0.80
+                    
+                    if is_full_page_background:
+                        logger.info(f"Keeping full-page background image at page {page_num}, "
+                                  f"area ratio: {area_ratio*100:.1f}%, format: {image_ext}, "
+                                  f"will extract COMPLETELY without cropping")
+                    
+                    # IMPORTANT: We do NOT filter large embedded images (even if >25% area) because:
+                    # - Complex background patterns are often embedded as large PNG images
+                    # - These are intentional design elements, not accidental screenshots
+                    # - Only filter if this is a RE-RENDERED screenshot (not original embedded image)
+                    # 
+                    # The distinction is made later by checking 'was_rerendered' flag
+                    
                     # Check image quality and determine action
                     quality_status, needs_large_image_enhancement = self._check_image_quality(pil_image, rect)
                     
@@ -377,42 +686,204 @@ class PDFParser:
                                   f"allowing underlying vector shapes to show")
                         continue
                     
-                    if quality_status == 'rerender' or needs_large_image_enhancement:
-                        # Check for text/shape overlaps BEFORE rerendering
-                        safe_rect = self._calculate_safe_rerender_bbox(rect, text_elements, page)
+                    # CRITICAL FIX: For embedded images, NEVER crop to avoid text
+                    # Embedded images (XObjects) do NOT contain text - text is a separate PDF layer
+                    # Therefore, we should always extract the COMPLETE embedded image
+                    # 
+                    # Only re-render if:
+                    # 1. Image is truly corrupted (quality_status == 'rerender')
+                    # 2. Image is NOT a full-page background
+                    # 3. Image lost its alpha channel and needs transparency restoration
+                    
+                    should_rerender = False
+                    rerender_reason = ""
+                    
+                    if is_full_page_background:
+                        # Always keep full-page backgrounds as-is
+                        logger.info(f"Full-page background at page {page_num} will be kept AS-IS without rerendering")
+                    elif quality_status == 'rerender':
+                        # Image is truly corrupted (all black/white) - needs re-rendering
+                        should_rerender = True
+                        rerender_reason = "truly corrupted"
+                    elif quality_status == 'process_alpha':
+                        # PNG with black background (lost alpha) - needs transparency restoration
+                        # CRITICAL FIX: Check DPI before deciding whether to rerender
+                        # If DPI is too low (< 150), we should rerender for quality improvement
+                        # while preserving alpha channel
                         
-                        if safe_rect and (safe_rect.width > 20 and safe_rect.height > 20):
-                            # Safe region found and is large enough to rerender
-                            logger.info(f"Re-rendering image at page {page_num} with safe bbox "
-                                      f"({safe_rect.x0:.1f}, {safe_rect.y0:.1f}, {safe_rect.x1:.1f}, {safe_rect.y1:.1f}), "
-                                      f"original bbox ({rect.x0:.1f}, {rect.y0:.1f}, {rect.x1:.1f}, {rect.y1:.1f})")
-                            zoom = 4.0  # High resolution
-                            matrix = fitz.Matrix(zoom, zoom)
-                            # CRITICAL FIX: Use alpha=True to preserve transparency!
-                            # This prevents PNG images from getting black backgrounds
-                            region_pix = page.get_pixmap(matrix=matrix, clip=safe_rect, alpha=True)
-                            image_bytes = region_pix.tobytes("png")
-                            image_ext = "png"
-                            
-                            # Update PIL image
-                            pil_image = Image.open(io.BytesIO(image_bytes))
-                            
-                            # Use safe_rect as the new rect
-                            rect = safe_rect
-                        elif quality_status == 'rerender':
-                            # For truly corrupted images, we still need to rerender even with overlap
-                            logger.warning(f"Re-rendering corrupted image at page {page_num} (has overlaps but required)")
-                            zoom = 4.0
-                            matrix = fitz.Matrix(zoom, zoom)
-                            # CRITICAL FIX: Use alpha=True to preserve transparency!
-                            # This prevents PNG images from getting black backgrounds
-                            region_pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=True)
-                            image_bytes = region_pix.tobytes("png")
-                            image_ext = "png"
-                            pil_image = Image.open(io.BytesIO(image_bytes))
+                        # Calculate DPI
+                        scale_x = pil_image.width / rect.width if rect.width > 0 else 0
+                        scale_y = pil_image.height / rect.height if rect.height > 0 else 0
+                        dpi_x = scale_x * 72
+                        dpi_y = scale_y * 72
+                        min_dpi = min(dpi_x, dpi_y)
+                        
+                        # Check if DPI is acceptable
+                        dpi_threshold = 150  # Minimum DPI for acceptable quality
+                        
+                        if min_dpi < dpi_threshold and needs_large_image_enhancement:
+                            # Low DPI + large image = needs quality enhancement
+                            # But ONLY if no text overlap (to avoid capturing text)
+                            safe_rect = self._calculate_safe_rerender_bbox(rect, text_elements, page)
+                            if safe_rect and safe_rect == rect:
+                                # No text overlap, safe to enhance
+                                should_rerender = True
+                                rerender_reason = f"quality enhancement (DPI {min_dpi:.1f} < {dpi_threshold}, no text overlap)"
+                                logger.info(f"Low DPI image at page {page_num}: {min_dpi:.1f} DPI, will rerender for quality")
+                            else:
+                                # Has text overlap - use image processing only
+                                logger.info(f"Low DPI image at page {page_num}: {min_dpi:.1f} DPI, but has text overlap - "
+                                          f"will use image processing for alpha without rerendering")
+                                pil_image = self._add_alpha_channel_to_png(pil_image)
+                                img_io = io.BytesIO()
+                                # CRITICAL: Save DPI information to prevent resampling in python-pptx
+                                dpi = pil_image.info.get('dpi', (72, 72))
+                                pil_image.save(img_io, format='PNG', dpi=dpi)
+                                image_bytes = img_io.getvalue()
+                                image_ext = 'png'
+                                logger.info(f"Added alpha channel: {pil_image.width}x{pil_image.height}px, mode={pil_image.mode}, DPI={dpi}")
                         else:
-                            # Large image needs enhancement but has overlaps, use original
-                            logger.info(f"Keeping original large image at page {page_num} due to text/shape overlaps")
+                            # DPI is acceptable or not a large image - just add alpha channel
+                            logger.info(f"Processing alpha channel for PNG at page {page_num} (DPI {min_dpi:.1f})")
+                            pil_image = self._add_alpha_channel_to_png(pil_image)
+                            img_io = io.BytesIO()
+                            # CRITICAL: Save DPI information to prevent resampling in python-pptx
+                            dpi = pil_image.info.get('dpi', (72, 72))
+                            pil_image.save(img_io, format='PNG', dpi=dpi)
+                            image_bytes = img_io.getvalue()
+                            image_ext = 'png'
+                            logger.info(f"Added alpha channel: {pil_image.width}x{pil_image.height}px, mode={pil_image.mode}, DPI={dpi}")
+                    elif quality_status == 'process_white_bg':
+                        # PNG with white background that should be transparent - needs white-to-transparent conversion
+                        # CRITICAL FIX: Check DPI before deciding whether to rerender
+                        # If DPI is too low (< 150), we should rerender for quality improvement
+                        # then convert white background to transparent
+                        
+                        # Calculate DPI
+                        scale_x = pil_image.width / rect.width if rect.width > 0 else 0
+                        scale_y = pil_image.height / rect.height if rect.height > 0 else 0
+                        dpi_x = scale_x * 72
+                        dpi_y = scale_y * 72
+                        min_dpi = min(dpi_x, dpi_y)
+                        
+                        # Check if DPI is acceptable
+                        dpi_threshold = 150  # Minimum DPI for acceptable quality
+                        
+                        if min_dpi < dpi_threshold and needs_large_image_enhancement:
+                            # Low DPI + large image = needs quality enhancement
+                            # But ONLY if no text overlap (to avoid capturing text)
+                            # 
+                            # CRITICAL: For white background images, we MUST NOT allow minor overlap
+                            # because rerendering would capture text into the image (text is usually not white)
+                            # This differs from black background images where alpha channel handles text properly
+                            # CRITICAL: For white background images, we MUST find a safe rect that avoids text
+                            # because rerendering would capture text into the image
+                            original_rect = fitz.Rect(rect)  # Save original for comparison
+                            safe_rect = self._calculate_safe_rerender_bbox(rect, text_elements, page, 
+                                                                           allow_minor_overlap=False)
+                            if safe_rect:
+                                # Found a safe rect - use it for rerendering
+                                rect = safe_rect  # Update rect to safe rect
+                                should_rerender = True
+                                
+                                # Check if rect was shrunk
+                                if (abs(safe_rect.x0 - original_rect.x0) < 1 and 
+                                    abs(safe_rect.y0 - original_rect.y0) < 1 and
+                                    abs(safe_rect.x1 - original_rect.x1) < 1 and
+                                    abs(safe_rect.y1 - original_rect.y1) < 1):
+                                    rerender_reason = f"quality enhancement with white-to-transparent (DPI {min_dpi:.1f} < {dpi_threshold}, no text overlap)"
+                                else:
+                                    rerender_reason = f"quality enhancement with white-to-transparent (DPI {min_dpi:.1f} < {dpi_threshold}, shrunk to avoid text)"
+                                    logger.info(f"Shrunk image rect to avoid text: ({original_rect.x0:.1f}, {original_rect.y0:.1f}, {original_rect.x1:.1f}, {original_rect.y1:.1f}) "
+                                              f"-> ({safe_rect.x0:.1f}, {safe_rect.y0:.1f}, {safe_rect.x1:.1f}, {safe_rect.y1:.1f})")
+                                logger.info(f"Low DPI image at page {page_num}: {min_dpi:.1f} DPI, will rerender safe region then convert white to transparent")
+                            else:
+                                # Cannot find safe rect - use image processing only
+                                logger.info(f"Low DPI image at page {page_num}: {min_dpi:.1f} DPI, but cannot find safe rect - "
+                                          f"will convert white to transparent without rerendering")
+                                pil_image = self._convert_white_bg_to_transparent(pil_image)
+                                img_io = io.BytesIO()
+                                # CRITICAL: Save DPI information to prevent resampling in python-pptx
+                                dpi = pil_image.info.get('dpi', (72, 72))
+                                pil_image.save(img_io, format='PNG', dpi=dpi)
+                                image_bytes = img_io.getvalue()
+                                image_ext = 'png'
+                                logger.info(f"Converted white to transparent: {pil_image.width}x{pil_image.height}px, mode={pil_image.mode}, DPI={dpi}")
+                        else:
+                            # DPI is acceptable or not a large image - just convert white to transparent
+                            logger.info(f"Converting white background to transparent for PNG at page {page_num} (DPI {min_dpi:.1f})")
+                            pil_image = self._convert_white_bg_to_transparent(pil_image)
+                            img_io = io.BytesIO()
+                            # CRITICAL: Save DPI information to prevent resampling in python-pptx
+                            dpi = pil_image.info.get('dpi', (72, 72))
+                            pil_image.save(img_io, format='PNG', dpi=dpi)
+                            image_bytes = img_io.getvalue()
+                            image_ext = 'png'
+                            logger.info(f"Converted white to transparent: {pil_image.width}x{pil_image.height}px, mode={pil_image.mode}, DPI={dpi}")
+                    elif needs_large_image_enhancement:
+                        # Large image that could benefit from quality enhancement
+                        # But ONLY if:
+                        # 1. DPI is too low (< 150)
+                        # 2. No text overlap (to avoid capturing text)
+                        
+                        # Calculate DPI to check if enhancement is really needed
+                        scale_x = pil_image.width / rect.width if rect.width > 0 else 0
+                        scale_y = pil_image.height / rect.height if rect.height > 0 else 0
+                        dpi_x = scale_x * 72
+                        dpi_y = scale_y * 72
+                        min_dpi = min(dpi_x, dpi_y)
+                        
+                        dpi_threshold = 150  # Minimum acceptable DPI
+                        
+                        if min_dpi < dpi_threshold:
+                            # DPI is too low, check for text overlap
+                            safe_rect = self._calculate_safe_rerender_bbox(rect, text_elements, page)
+                            if safe_rect and safe_rect == rect:
+                                # No text overlap, safe to enhance
+                                should_rerender = True
+                                rerender_reason = f"quality enhancement (DPI {min_dpi:.1f} < {dpi_threshold}, no text overlap)"
+                                logger.info(f"Large image at page {page_num} has low DPI ({min_dpi:.1f}), will rerender for quality")
+                            else:
+                                # Has text overlap - keep original to avoid capturing text
+                                logger.info(f"Large image at page {page_num} has low DPI ({min_dpi:.1f}) but has text overlap - "
+                                          f"keeping original to avoid capturing text")
+                        else:
+                            # DPI is acceptable, no need to rerender
+                            logger.info(f"Large image at page {page_num} has acceptable DPI ({min_dpi:.1f}), keeping original")
+                    
+                    # Perform re-rendering if needed
+                    if should_rerender:
+                        logger.info(f"Re-rendering image at page {page_num} for: {rerender_reason}")
+                        # CRITICAL: Use zoom=8.0 to account for PPT scale factor (typically 2.0)
+                        # This ensures final DPI > 150 even after scaling
+                        zoom = 8.0  # High resolution (288 DPI -> 576 DPI after 2x scale = 288 DPI final)
+                        matrix = fitz.Matrix(zoom, zoom)
+                        
+                        # CRITICAL: Choose alpha parameter based on background type
+                        # - For images with black background (lost alpha): use alpha=True to restore transparency
+                        # - For images with white background: use alpha=False first, then convert white to transparent
+                        # - For other images: use alpha=False to preserve white as content
+                        use_alpha = (quality_status == 'process_alpha')  # Only true for black background images
+                        
+                        region_pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=use_alpha)
+                        image_bytes = region_pix.tobytes("png")
+                        image_ext = "png"
+                        
+                        # Update PIL image
+                        pil_image = Image.open(io.BytesIO(image_bytes))
+                        
+                        logger.info(f"Re-rendered image: {pil_image.width}x{pil_image.height}px, mode={pil_image.mode}, alpha={use_alpha}")
+                        
+                        # Post-process: Convert white background to transparent if needed
+                        if quality_status == 'process_white_bg':
+                            logger.info(f"Post-processing: Converting white background to transparent")
+                            pil_image = self._convert_white_bg_to_transparent(pil_image)
+                            img_io = io.BytesIO()
+                            # CRITICAL: Save DPI information to prevent resampling in python-pptx
+                            dpi = pil_image.info.get('dpi', (72, 72))
+                            pil_image.save(img_io, format='PNG', dpi=dpi)
+                            image_bytes = img_io.getvalue()
+                            logger.info(f"White-to-transparent conversion complete: {pil_image.width}x{pil_image.height}px, mode={pil_image.mode}, DPI={dpi}")
                     
                     element = {
                         'type': 'image',
@@ -427,7 +898,8 @@ class PDFParser:
                         'width': rect.width,
                         'height': rect.height,
                         'image_id': f"page{page_num}_img{img_index}",
-                        'was_rerendered': (quality_status == 'rerender' or needs_large_image_enhancement)
+                        'was_rerendered': (quality_status == 'rerender' or needs_large_image_enhancement),
+                        'is_full_page_background': is_full_page_background  # Mark for bottom layer rendering
                     }
                     
                     image_elements.append(element)
@@ -483,18 +955,22 @@ class PDFParser:
         
         return opacity_map
     
-    def _extract_drawings(self, page: fitz.Page, opacity_map: Dict[str, float] = None) -> List[Dict[str, Any]]:
+    def _extract_drawings(self, page: fitz.Page, opacity_map: Dict[str, float] = None, page_num: int = 0, 
+                         text_elements: List[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Extract vector drawings and shapes from the page with opacity information.
         
         Args:
             page: PyMuPDF page object
             opacity_map: Mapping of graphics state names to opacity values
+            page_num: Page number (0-indexed) for logging
+            text_elements: Optional list of text elements for gradient page number detection
             
         Returns:
-            List of drawing element dictionaries
+            Tuple of (drawing_elements, gradient_images)
         """
         drawing_elements = []
+        gradient_images = []  # Store gradient images detected
         
         if opacity_map is None:
             opacity_map = {}
@@ -503,10 +979,21 @@ class PDFParser:
             # Get drawing paths
             drawings = page.get_drawings()
             
+            # CRITICAL: Detect gradient patterns BEFORE processing individual shapes
+            # Gradients are often complex vector patterns (especially in headers/footers)
+            # that should be rendered as images instead of being converted to shapes
+            # Pass text_elements for page number detection in gradient regions
+            gradient_images = self.gradient_detector.detect_and_extract_gradients(
+                page, drawings, page_num, text_elements
+            )
+            
             # Parse content stream to build a position-based opacity map
             opacity_by_position = self._parse_content_stream_opacity_enhanced(page, opacity_map)
             
             # Convert drawings to shape elements
+            # CRITICAL: Preserve the PDF drawing order via pdf_index
+            # In PDF, elements drawn later appear on top
+            # This index will be used for proper z-ordering
             for idx, drawing in enumerate(drawings):
                 rect = drawing.get("rect")
                 if not rect:
@@ -556,7 +1043,8 @@ class PDFParser:
                     'fill_color': self._rgb_to_hex(drawing.get("fill", None)),
                     'fill_opacity': fill_opacity,
                     'stroke_color': self._rgb_to_hex(drawing.get("color", None)),
-                    'stroke_width': drawing.get("width", 1)
+                    'stroke_width': drawing.get("width", 1),
+                    'pdf_index': idx  # CRITICAL: Preserve PDF drawing order
                 }
                 
                 drawing_elements.append(element)
@@ -570,17 +1058,49 @@ class PDFParser:
             # This must happen before deduplication to preserve the overlapping shapes
             drawing_elements = self.shape_merger.merge_shapes(drawing_elements)
             
+            # Remove exact duplicates (same position + size + colors)
+            # This fixes issues like Page 6 where large rectangles are drawn twice
+            drawing_elements = self._remove_exact_duplicates(drawing_elements)
+            
+            # Remove redundant decorative borders (larger path borders that overlap with simpler rectangles)
+            # This fixes the duplicate border issue on page 6 of season_report_del.pdf
+            drawing_elements = self._remove_redundant_decorative_borders(drawing_elements)
+            
             # Now deduplicate overlapping shapes (removes border artifacts)
             drawing_elements = self._deduplicate_overlapping_shapes(drawing_elements)
             
             # Add detected borders after deduplication
             if border_elements:
+                # Assign pdf_index to border elements (put them at the end)
+                max_index = max([s.get('pdf_index', 0) for s in drawing_elements], default=0)
+                for i, border in enumerate(border_elements):
+                    border['pdf_index'] = max_index + i + 1
                 drawing_elements.extend(border_elements)
+            
+            # Filter out shapes that are part of detected gradients
+            # These shapes have been rendered as images and should not be duplicated as vectors
+            if gradient_images:
+                original_count = len(drawing_elements)
+                drawing_elements = [
+                    shape for shape in drawing_elements
+                    if not self.gradient_detector.should_exclude_shape_in_gradient(shape, gradient_images)
+                ]
+                excluded_count = original_count - len(drawing_elements)
+                if excluded_count > 0:
+                    logger.info(f"Excluded {excluded_count} shape(s) that are part of gradient pattern(s)")
+            
+            # CRITICAL: DO NOT sort shapes - preserve PDF drawing order
+            # The pdf_index field preserves the original PDF drawing order
+            # In PDF, elements drawn later appear on top
+            # Sorting by heuristics (size, type) breaks correct layering
+            logger.info(f"Preserved PDF drawing order for {len(drawing_elements)} shapes")
                 
         except Exception as e:
             logger.warning(f"Failed to extract drawings: {e}")
         
-        return drawing_elements
+        # Return both gradient images and remaining shapes
+        # Gradient images will be added to page elements separately
+        return drawing_elements, gradient_images
     
     def _parse_content_stream_opacity(self, page: fitz.Page, opacity_map: Dict[str, float]) -> List[float]:
         """
@@ -750,6 +1270,153 @@ class PDFParser:
         
         # Default to fully opaque
         return 1.0
+    
+    def _remove_exact_duplicates(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Remove exact duplicate shapes (same position, size, and colors).
+        
+        This fixes issues where PDF renders the same shape multiple times,
+        like the duplicate card rectangles on page 6.
+        
+        Args:
+            shapes: List of shape elements
+            
+        Returns:
+            List of shapes with exact duplicates removed
+        """
+        if not shapes:
+            return shapes
+        
+        seen = []
+        unique_shapes = []
+        
+        for shape in shapes:
+            # Create a signature for this shape
+            # Round coordinates to 0.1pt precision to catch near-exact duplicates
+            signature = (
+                round(shape.get('x', 0), 1),
+                round(shape.get('y', 0), 1),
+                round(shape.get('width', 0), 1),
+                round(shape.get('height', 0), 1),
+                shape.get('fill_color'),
+                shape.get('stroke_color')
+            )
+            
+            if signature not in seen:
+                seen.append(signature)
+                unique_shapes.append(shape)
+            else:
+                logger.debug(f"Removed exact duplicate at ({shape.get('x'):.1f}, {shape.get('y'):.1f}), "
+                           f"size {shape.get('width'):.1f}x{shape.get('height'):.1f}")
+        
+        removed_count = len(shapes) - len(unique_shapes)
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} exact duplicate shape(s)")
+        
+        return unique_shapes
+    
+    def _remove_redundant_decorative_borders(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Remove redundant decorative border shapes that overlap with simpler card border rectangles.
+        
+        In some PDFs (like season_report_del.pdf page 6), each card has two overlapping white borders:
+        1. An outer decorative path border (type='path', made of many line segments)
+        2. An inner simple rectangle border (type='rectangle', single rect element)
+        
+        This creates visual duplication with 2 borders per card instead of 1.
+        
+        Strategy:
+        - Detect pairs of overlapping white-stroke shapes (no fill)
+        - If one is a complex path and the other is a simple rectangle
+        - And the path completely contains the rectangle
+        - Remove the redundant outer decorative path border
+        
+        Args:
+            shapes: List of shape elements
+            
+        Returns:
+            List of shapes with redundant decorative borders removed
+        """
+        if len(shapes) <= 1:
+            return shapes
+        
+        filtered_shapes = []
+        skip_indices = set()
+        
+        for i, shape1 in enumerate(shapes):
+            if i in skip_indices:
+                continue
+            
+            # Check if this is a potential decorative border/background 
+            # (path with white stroke, large, either with or without fill)
+            is_path1 = shape1.get('shape_type') == 'path'
+            stroke_color1 = shape1.get('stroke_color')
+            has_white_stroke1 = stroke_color1 and stroke_color1.upper() in ['#FFFFFF', '#FFF']
+            is_large1 = shape1.get('width', 0) > 2 and shape1.get('height', 0) > 1
+            
+            # Accept both filled and unfilled paths as decorative candidates
+            is_decorative_candidate = is_path1 and has_white_stroke1 and is_large1
+            
+            if not is_decorative_candidate:
+                filtered_shapes.append(shape1)
+                continue
+            
+            # Look for a simpler overlapping rectangle that this decorative border surrounds
+            found_overlap = False
+            
+            for j, shape2 in enumerate(shapes):
+                if i == j or j in skip_indices:
+                    continue
+                
+                # Check if shape2 is a simple rectangle with same stroke properties
+                # (regardless of fill - we just need the simpler inner border)
+                is_rect2 = shape2.get('shape_type') == 'rectangle'
+                stroke_color2 = shape2.get('stroke_color')
+                has_white_stroke2 = stroke_color2 and stroke_color2.upper() in ['#FFFFFF', '#FFF']
+                is_large2 = shape2.get('width', 0) > 2 and shape2.get('height', 0) > 1
+                
+                is_simple_border = is_rect2 and has_white_stroke2 and is_large2
+                
+                if not is_simple_border:
+                    continue
+                
+                # Check if shape1 (decorative path) contains shape2 (simple rectangle)
+                # Shape1 should be larger and contain shape2
+                x1, y1 = shape1.get('x', 0), shape1.get('y', 0)
+                w1, h1 = shape1.get('width', 0), shape1.get('height', 0)
+                
+                x2, y2 = shape2.get('x', 0), shape2.get('y', 0)
+                w2, h2 = shape2.get('width', 0), shape2.get('height', 0)
+                
+                # Check if shape2 is inside shape1 (with some tolerance)
+                tolerance = 30  # 30 points tolerance
+                
+                # Shape2's bounds should be inside shape1's bounds
+                contains_left = x1 <= x2 + tolerance
+                contains_top = y1 <= y2 + tolerance
+                contains_right = (x1 + w1) >= (x2 + w2) - tolerance
+                contains_bottom = (y1 + h1) >= (y2 + h2) - tolerance
+                
+                # Shape1 should be larger than shape2
+                is_larger = w1 > w2 and h1 > h2
+                
+                if contains_left and contains_top and contains_right and contains_bottom and is_larger:
+                    # Found an overlapping simpler rectangle inside this decorative path
+                    # Skip the decorative path border (shape1)
+                    skip_indices.add(i)
+                    found_overlap = True
+                    logger.debug(f"Removed redundant decorative border at ({x1:.1f}, {y1:.1f}) "
+                               f"size {w1:.1f}x{h1:.1f}, overlaps with simpler rectangle at ({x2:.1f}, {y2:.1f})")
+                    break
+            
+            if not found_overlap:
+                filtered_shapes.append(shape1)
+        
+        removed_count = len(shapes) - len(filtered_shapes)
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} redundant decorative border(s)")
+        
+        return filtered_shapes
     
     def _deduplicate_overlapping_shapes(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -976,44 +1643,59 @@ class PDFParser:
         # DETECTION LOGIC (order matters - most specific first)
         
         # 1. Circle/Oval Detection
-        # Circles use Bezier curves (typically many curves without lines)
-        # Key indicators: Many curves (40+), NO or very few lines, aspect ratio reasonable
-        # IMPORTANT: Rounded rectangles also have curves but with straight line segments
+        # Circles use Bezier curves (typically 4 curves for a perfect circle, more for approximations)
+        # Key indicators: 4+ curves, aspect ratio near 1.0, curve-dominant structure
+        # IMPORTANT: Distinguish between:
+        #   - True circles/ovals: curves dominate, lines are just connectors (curve-to-line ratio > 1:1)
+        #   - Rounded rectangles: lines dominate, curves are just for corners (curve-to-line ratio < 1:1)
         if curve_count >= 4:
-            # Distinguish between rounded rectangles and true ovals/circles:
-            # - Rounded rectangles: fewer curves (4-32), has line segments, any aspect ratio
-            # - True ovals/circles: many curves (40+), no/few lines, aspect ratio 0.5-2.0
+            # Calculate curve dominance ratio
+            # A circle has 4 curves and minimal connecting lines (8-10 items typical)
+            # A rounded rectangle has 4 curves but many straight lines (20+ items typical)
+            curve_to_line_ratio = curve_count / max(line_count, 1)
+            total_items = curve_count + line_count
+            curve_percentage = (curve_count / total_items) if total_items > 0 else 0
             
-            # Check if this is a rounded rectangle (has line segments connecting curves)
-            if line_count > 0:
-                # Has straight line segments = rounded rectangle
-                logger.debug(f"Detected rounded rectangle: {curve_count} curves + {line_count} lines, aspect {aspect_ratio:.3f}")
-                return 'rectangle'
+            # Strategy: Use multiple signals to distinguish circles from rounded rectangles
+            # - Aspect ratio (circles are roughly square: 0.8-1.2)
+            # - Curve dominance (circles have curves >= lines)
+            # - Total item count (circles are simpler: 8-12 items; rounded rects are more complex: 20+ items)
             
-            # No lines - check curve count and aspect ratio
-            if curve_count >= 40:
-                # Many curves without lines = true oval/circle
-                if 0.9 <= aspect_ratio <= 1.1:
-                    logger.debug(f"Detected circle: {curve_count} curves (no lines), aspect {aspect_ratio:.3f}")
+            # Strong circle indicators (high confidence)
+            is_square_aspect = 0.8 <= aspect_ratio <= 1.2
+            is_curve_dominant = curve_to_line_ratio >= 1.0  # More or equal curves than lines
+            is_simple_shape = total_items <= 12  # Circles are simple (typically 8-10 items)
+            
+            # Check for strong circle signal: square aspect + curve dominant + simple
+            if is_square_aspect and is_curve_dominant and is_simple_shape:
+                logger.debug(f"Detected circle: {curve_count} curves, {line_count} lines, aspect {aspect_ratio:.3f}, ratio {curve_to_line_ratio:.2f}")
+                return 'oval'
+            
+            # Check for moderate circle signal: square aspect + either curve dominant OR simple
+            # This catches cases where lines are used for connection but shape is clearly circular
+            if is_square_aspect and (is_curve_dominant or is_simple_shape):
+                # Additional check: if curve percentage is high (>40%), likely a circle
+                if curve_percentage >= 0.4:
+                    logger.debug(f"Detected circle (moderate): {curve_count} curves, {line_count} lines, aspect {aspect_ratio:.3f}, curve% {curve_percentage:.2f}")
                     return 'oval'
-                elif 0.5 <= aspect_ratio <= 2.0:
-                    logger.debug(f"Detected oval/ellipse: {curve_count} curves (no lines), aspect {aspect_ratio:.3f}")
+            
+            # Check for oval/ellipse: elongated but still curve-dominant
+            if 0.5 <= aspect_ratio <= 2.0 and is_curve_dominant:
+                # Only classify as oval if curves clearly dominate
+                if curve_percentage >= 0.5:  # At least 50% curves
+                    logger.debug(f"Detected oval/ellipse: {curve_count} curves, {line_count} lines, aspect {aspect_ratio:.3f}")
                     return 'oval'
-                else:
-                    # Very elongated shape even with many curves
-                    logger.debug(f"Detected elongated rounded rectangle: {curve_count} curves, aspect {aspect_ratio:.3f}")
-                    return 'rectangle'
-            else:
-                # Fewer curves (< 40) without lines - likely a rounded rectangle with curved corners only
-                # Aspect ratio matters here
-                if aspect_ratio < 0.5 or aspect_ratio > 2.0:
-                    logger.debug(f"Detected rounded rectangle: {curve_count} curves (no lines), extreme aspect {aspect_ratio:.3f}")
-                    return 'rectangle'
-                else:
-                    # Moderate curve count, moderate aspect ratio, no lines
-                    # This is ambiguous - default to rectangle for safety
-                    logger.debug(f"Detected rounded rectangle (ambiguous): {curve_count} curves, aspect {aspect_ratio:.3f}")
-                    return 'rectangle'
+            
+            # Many curves (40+) without line dominance = complex oval approximation
+            if curve_count >= 40 and curve_to_line_ratio >= 0.8:
+                if 0.5 <= aspect_ratio <= 2.0:
+                    logger.debug(f"Detected complex oval: {curve_count} curves, aspect {aspect_ratio:.3f}")
+                    return 'oval'
+            
+            # If we reach here, it's likely a rounded rectangle
+            # (low curve-to-line ratio, or extreme aspect ratio, or many items suggesting complex shape)
+            logger.debug(f"Detected rounded rectangle: {curve_count} curves, {line_count} lines, aspect {aspect_ratio:.3f}, ratio {curve_to_line_ratio:.2f}")
+            return 'rectangle'
         
         # 2. Line Detection (single line, stroke-only shapes)
         # Lines are critical for triangles and other geometric shapes
@@ -1102,6 +1784,95 @@ class PDFParser:
         # Fallback for unexpected color format
         logger.warning(f"Unexpected color format: {color} (type: {type(color)})")
         return None
+    
+    def _sort_shapes_by_layer(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Sort shapes by visual layer order to ensure proper rendering.
+        
+        Background elements (thin horizontal lines, gridlines) should be rendered first (bottom layer).
+        Foreground elements (bars, columns, filled shapes) should be rendered last (top layer).
+        
+        This fixes issues where PDF internal order places gridlines after bar charts,
+        causing gridlines to cover the bars in PowerPoint.
+        
+        Args:
+            shapes: List of shape elements
+            
+        Returns:
+            Sorted list of shape elements
+        """
+        if not shapes:
+            return shapes
+        
+        # Categorize shapes into layers based on their visual characteristics
+        layer_assignments = []
+        
+        for shape in shapes:
+            width = shape.get('width', 0)
+            height = shape.get('height', 0)
+            shape_type = shape.get('shape_type', 'rectangle')
+            fill_color = shape.get('fill_color')
+            stroke_color = shape.get('stroke_color')
+            
+            # Determine layer priority (lower number = render first = bottom layer)
+            # Layer 0: Background elements (thin lines, especially horizontal gridlines)
+            # Layer 1: Medium elements (decorative shapes, borders)
+            # Layer 2: Foreground elements (bars, filled shapes)
+            layer = 1  # Default: medium layer
+            
+            # Detect thin horizontal lines (gridlines, baselines)
+            # These are typically gray and span across the chart area
+            is_thin_horizontal = (height < 5 and width > 50)
+            is_thin_vertical = (width < 5 and height > 50)
+            is_thin_line = is_thin_horizontal or is_thin_vertical
+            
+            # Detect bar chart columns (tall rectangles with fill)
+            # These should be on top of gridlines
+            is_bar_chart = (height > 20 and width > 10 and width < 200 and fill_color is not None)
+            
+            # Detect large filled shapes (backgrounds, cards)
+            is_large_background = (width > 300 or height > 300) and fill_color is not None
+            
+            # Layer assignment logic
+            if is_thin_line:
+                # Thin lines (gridlines) go to background
+                layer = 0
+                logger.debug(f"Layer 0 (gridline): {width:.1f}x{height:.1f}, fill={fill_color}, stroke={stroke_color}")
+            elif is_large_background:
+                # Large backgrounds also go to background
+                layer = 0
+                logger.debug(f"Layer 0 (background): {width:.1f}x{height:.1f}")
+            elif is_bar_chart:
+                # Bar charts go to foreground
+                layer = 2
+                logger.debug(f"Layer 2 (bar): {width:.1f}x{height:.1f}, fill={fill_color}")
+            elif shape_type in ['oval', 'circle']:
+                # Circles and ovals typically foreground decoration
+                layer = 2
+                logger.debug(f"Layer 2 (circle): {width:.1f}x{height:.1f}")
+            elif fill_color and not is_thin_line:
+                # Other filled shapes go to foreground
+                layer = 2
+                logger.debug(f"Layer 2 (filled): {width:.1f}x{height:.1f}, fill={fill_color}")
+            else:
+                # Everything else stays in medium layer
+                layer = 1
+            
+            layer_assignments.append((layer, shape))
+        
+        # Sort by layer (ascending), preserving original order within each layer
+        layer_assignments.sort(key=lambda x: x[0])
+        
+        # Extract sorted shapes
+        sorted_shapes = [shape for _, shape in layer_assignments]
+        
+        # Log layer distribution
+        layer_counts = {}
+        for layer, _ in layer_assignments:
+            layer_counts[layer] = layer_counts.get(layer, 0) + 1
+        logger.info(f"Layer distribution: {layer_counts}")
+        
+        return sorted_shapes
     
     def extract_all_pages(self) -> List[Dict[str, Any]]:
         """
@@ -1211,18 +1982,115 @@ class PDFParser:
                 # Count black pixels in corner/edge samples
                 black_count = sum(1 for p in pixels if all(c < 30 for c in p[:3]))
                 
+                # Count white pixels in corner/edge samples
+                white_count = sum(1 for p in pixels if all(c > 240 for c in p[:3]))
+                
+                # Check 2a: PNG with black background (lost alpha)
                 # If image has significant black edges but is not purely black
                 if black_count >= 4 and black_count < len(pixels):
                     # Check if there are also some colored pixels (not just black)
                     has_color = any(max(p[:3]) > 30 for p in pixels)
                     
                     if has_color:
-                        # This is likely an image with lost alpha channel (transparent areas became black)
+                        # CRITICAL FIX: 这是丢失alpha通道的PNG，但不应该rerender!
+                        # rerender会截图，把文字也截进去
+                        # 正确做法: 保持原始XObject，通过图像处理添加alpha通道
+                        #
+                        # QUALITY FIX: Check if this image also needs quality enhancement
+                        # LOW DPI THRESHOLD: Lower threshold from 200pt to 50pt to catch small icons/arrows
+                        # Small images (like 58x58pt arrows) are especially visible when low DPI
+                        # because jagged edges are more prominent at small sizes
+                        is_large = rect and (rect.width > 50 or rect.height > 50)
+                        needs_enhancement = False
+                        
+                        if is_large:
+                            # Check if this is a decorative image that should NOT be enhanced
+                            is_moderate_size = (width < 600 and height < 600)
+                            
+                            if is_moderate_size:
+                                # Check color diversity to determine if decorative
+                                img_array = np.array(pil_image)
+                                if len(img_array.shape) == 3:
+                                    unique_colors = len(np.unique(img_array.reshape(-1, img_array.shape[-1]), axis=0))
+                                    is_decorative = (30 <= unique_colors <= 500)
+                                    needs_enhancement = not is_decorative
+                                else:
+                                    needs_enhancement = True
+                            else:
+                                # Large image (>600px), definitely needs enhancement check
+                                needs_enhancement = True
+                        
                         logger.info(
                             f"Detected PNG with black background (lost alpha): {width}x{height}px, "
-                            f"{black_count}/{len(pixels)} black edge pixels - will re-render with transparency"
+                            f"{black_count}/{len(pixels)} black edge pixels - will add alpha channel via image processing"
                         )
-                        return ('rerender', False)
+                        # 返回'process_alpha'，并附带needs_large_image_enhancement状态
+                        return ('process_alpha', needs_enhancement)
+                
+                # Check 2b: PNG with white background that should be transparent
+                # Detection: RGB mode + significant white pixels + has non-white content
+                # This is common in rendered graphics/diagrams that should have transparent backgrounds
+                # 
+                # CRITICAL: Must exclude decorative images (30-500 unique colors)
+                # Decorative images' white pixels are part of the design, not background
+                if white_count >= 4 and white_count < len(pixels):
+                    # Check if there are also some colored pixels (not just white)
+                    has_color = any(min(p[:3]) < 240 for p in pixels)
+                    
+                    if has_color:
+                        # CRITICAL: Check if this is a decorative image BEFORE processing
+                        # Decorative images should NOT have white background converted to transparent
+                        is_moderate_size = (width < 600 and height < 600)
+                        
+                        if is_moderate_size:
+                            # Check color diversity to determine if decorative
+                            img_array = np.array(pil_image)
+                            if len(img_array.shape) == 3:
+                                unique_colors = len(np.unique(img_array.reshape(-1, img_array.shape[-1]), axis=0))
+                                is_decorative = (30 <= unique_colors <= 500)
+                                
+                                if is_decorative:
+                                    # This is a decorative image - do NOT convert white to transparent
+                                    # White pixels are part of the design, not background
+                                    logger.info(
+                                        f"Detected decorative image with white pixels: {width}x{height}px, "
+                                        f"{unique_colors} colors - will NOT convert white to transparent"
+                                    )
+                                    # Skip white background processing for decorative images
+                                    # Continue to next checks
+                                else:
+                                    # Not decorative, has white background that should be transparent
+                                    # LOWERED THRESHOLD: 50pt instead of 200pt to catch small icons
+                                    is_large = rect and (rect.width > 50 or rect.height > 50)
+                                    needs_enhancement = is_large  # Large non-decorative images need enhancement
+                                    
+                                    logger.info(
+                                        f"Detected PNG with white background (should be transparent): {width}x{height}px, "
+                                        f"{white_count}/{len(pixels)} white edge pixels, {unique_colors} colors - will convert white to transparent"
+                                    )
+                                    return ('process_white_bg', needs_enhancement)
+                            else:
+                                # Can't analyze colors, treat as white background
+                                # LOWERED THRESHOLD: 50pt instead of 200pt
+                                is_large = rect and (rect.width > 50 or rect.height > 50)
+                                needs_enhancement = is_large
+                                
+                                logger.info(
+                                    f"Detected PNG with white background (should be transparent): {width}x{height}px, "
+                                    f"{white_count}/{len(pixels)} white edge pixels - will convert white to transparent"
+                                )
+                                return ('process_white_bg', needs_enhancement)
+                        else:
+                            # Large image (>600px), likely needs white-to-transparent conversion
+                            # LOWERED THRESHOLD: 50pt instead of 200pt
+                            is_large = rect and (rect.width > 50 or rect.height > 50)
+                            needs_enhancement = is_large
+                            
+                            logger.info(
+                                f"Detected PNG with white background (should be transparent): {width}x{height}px, "
+                                f"{white_count}/{len(pixels)} white edge pixels - will convert white to transparent"
+                            )
+                            return ('process_white_bg', needs_enhancement)
             
             # Check 3: Low-quality embedded icon detection
             # These are small PNG icons with no alpha channel and limited colors
@@ -1258,18 +2126,56 @@ class PDFParser:
             #
             # This solves the duplication issue while still improving image quality.
             #
+            # CRITICAL FIX v3: Exclude decorative images from large image enhancement
+            # Decorative images are intentional design elements with moderate color diversity
+            # that should NOT be rerendered as this can cause heavy cropping due to text overlaps
+            #
             # Check if this is a large image that could benefit from enhancement
-            is_large = rect and (rect.width > 200 or rect.height > 200)
+            # LOWERED THRESHOLD: 50pt instead of 200pt to catch small icons/arrows
+            is_large = rect and (rect.width > 50 or rect.height > 50)
             needs_large_image_enhancement = False
             
             if is_large and pil_image.mode == 'RGB':
-                # Large RGB images often have quality issues
-                # Signal that enhancement is desired, but let _extract_images decide
-                # based on overlap detection
-                needs_large_image_enhancement = True
-                logger.debug(
-                    f"Detected large PNG image: {width}x{height}px - may re-render if no text/shape overlaps"
-                )
+                # Check if this is a decorative image (should not be rerendered)
+                # Decorative images have:
+                # - Moderate dimensions (< 600px in both dimensions)
+                # - Moderate color diversity (between 30-500 unique colors)
+                # - These are intentional embedded design elements
+                is_moderate_size = (width < 600 and height < 600)
+                
+                if is_moderate_size:
+                    # Check color diversity
+                    img_array = np.array(pil_image)
+                    if len(img_array.shape) == 3:
+                        unique_colors = len(np.unique(img_array.reshape(-1, img_array.shape[-1]), axis=0))
+                        is_decorative = (30 <= unique_colors <= 500)
+                        
+                        if is_decorative:
+                            # This is likely a decorative image - do NOT rerender
+                            # Rerendering would cause heavy cropping due to text overlaps
+                            logger.info(
+                                f"Detected decorative image: {width}x{height}px, {unique_colors} colors - "
+                                f"will keep as-is without rerendering to preserve design"
+                            )
+                            needs_large_image_enhancement = False
+                        else:
+                            # Not decorative, proceed with enhancement
+                            needs_large_image_enhancement = True
+                            logger.debug(
+                                f"Detected large PNG image: {width}x{height}px - may re-render if no text/shape overlaps"
+                            )
+                    else:
+                        # Can't analyze, proceed with enhancement
+                        needs_large_image_enhancement = True
+                        logger.debug(
+                            f"Detected large PNG image: {width}x{height}px - may re-render if no text/shape overlaps"
+                        )
+                else:
+                    # Very large image, likely needs enhancement
+                    needs_large_image_enhancement = True
+                    logger.debug(
+                        f"Detected large PNG image: {width}x{height}px - may re-render if no text/shape overlaps"
+                    )
             
             # Check 5: Low-quality rasterized vector graphics
             # These are medium-sized PNG images that are actually poorly rasterized vector shapes
@@ -1315,24 +2221,32 @@ class PDFParser:
             return ('good', False)
     
     def _calculate_safe_rerender_bbox(self, img_rect: fitz.Rect, text_elements: List[Dict[str, Any]], 
-                                       page: fitz.Page) -> Optional[fitz.Rect]:
+                                       page: fitz.Page, allow_minor_overlap: bool = True, 
+                                       overlap_threshold: float = 0.10) -> Optional[fitz.Rect]:
         """
         Calculate a safe bounding box for rerendering an image that avoids overlapping text/shapes.
         
         This method detects overlaps between the image bbox and text/shape bboxes, then shrinks
-        the image bbox to exclude the overlapping regions.
+        the image bbox to exclude the overlapping regions. It tries all four shrink directions
+        (top, bottom, left, right) and chooses the one that preserves the most area.
         
         Args:
             img_rect: Original image rectangle
             text_elements: List of already-extracted text elements
             page: PyMuPDF page object for shape detection
+            allow_minor_overlap: If True, allow rerendering if total overlap < threshold
+            overlap_threshold: Maximum allowed overlap ratio (default 0.10 = 10%)
             
         Returns:
-            Safe rectangle for rerendering, or None if no safe region exists
+            Safe rectangle for rerendering (or original if overlap is acceptable), or None if unsafe
         """
         # Start with the original rect
         safe_rect = fitz.Rect(img_rect)
         margin = 2.0  # Add small margin to avoid edge overlaps
+        
+        # Track total overlap for minor overlap tolerance
+        total_overlap_area = 0.0
+        overlapping_texts = []
         
         # Check overlaps with text elements
         for text_elem in text_elements:
@@ -1341,58 +2255,592 @@ class PDFParser:
             
             # Check if text overlaps with current safe_rect
             if safe_rect.intersects(text_rect):
+                # Calculate overlap area to filter out trivial overlaps
+                overlap_rect = safe_rect & text_rect
+                overlap_area = overlap_rect.width * overlap_rect.height if overlap_rect else 0
+                
+                # CRITICAL: Ignore trivial overlaps (< 100 pt²)
+                # These are typically edge cases where text barely touches image
+                # Rerendering won't capture such minimal overlaps
+                if overlap_area < 100:
+                    logger.debug(f"Ignoring trivial overlap ({overlap_area:.1f} pt²) with text "
+                               f"'{text_elem.get('content', '')[:20]}...'")
+                    continue
+                
+                # Track overlap
+                total_overlap_area += overlap_area
+                overlapping_texts.append((text_elem.get('content', '')[:30], overlap_area))
+                
                 # Text overlaps - we need to shrink safe_rect to avoid it
                 logger.debug(f"Text '{text_elem.get('content', '')[:20]}...' overlaps image at "
                            f"({text_rect.x0:.1f}, {text_rect.y0:.1f}, {text_rect.x1:.1f}, {text_rect.y1:.1f})")
                 
-                # Determine which edge to shrink
-                # If text is at the top of image, move safe_rect's top down
-                if text_rect.y0 < safe_rect.y0 + safe_rect.height * 0.3:
-                    # Text is in top portion of image
-                    new_y0 = text_rect.y1 + margin
-                    if new_y0 < safe_rect.y1:
-                        safe_rect.y0 = new_y0
-                        logger.debug(f"Shrunk image top to y={new_y0:.1f} to avoid text")
+                # Try all four shrink directions and calculate resulting areas
+                # This ensures we choose the best option that preserves the most image content
+                shrink_options = []
                 
-                # If text is at the bottom of image, move safe_rect's bottom up
-                elif text_rect.y1 > safe_rect.y0 + safe_rect.height * 0.7:
-                    # Text is in bottom portion of image
-                    new_y1 = text_rect.y0 - margin
-                    if new_y1 > safe_rect.y0:
-                        safe_rect.y1 = new_y1
-                        logger.debug(f"Shrunk image bottom to y={new_y1:.1f} to avoid text")
+                # Option 1: Shrink from top (move top edge down to below text)
+                top_rect = fitz.Rect(safe_rect)
+                top_rect.y0 = text_rect.y1 + margin
+                if top_rect.y0 < top_rect.y1:
+                    top_area = top_rect.width * top_rect.height
+                    shrink_options.append(('top', top_rect, top_area))
+                    logger.debug(f"  Option: shrink top to y={top_rect.y0:.1f}, area={top_area:.1f}")
                 
-                # If text is on the left side
-                elif text_rect.x0 < safe_rect.x0 + safe_rect.width * 0.3:
-                    # Text is in left portion of image
-                    new_x0 = text_rect.x1 + margin
-                    if new_x0 < safe_rect.x1:
-                        safe_rect.x0 = new_x0
-                        logger.debug(f"Shrunk image left to x={new_x0:.1f} to avoid text")
+                # Option 2: Shrink from bottom (move bottom edge up to above text)
+                bottom_rect = fitz.Rect(safe_rect)
+                bottom_rect.y1 = text_rect.y0 - margin
+                if bottom_rect.y1 > bottom_rect.y0:
+                    bottom_area = bottom_rect.width * bottom_rect.height
+                    shrink_options.append(('bottom', bottom_rect, bottom_area))
+                    logger.debug(f"  Option: shrink bottom to y={bottom_rect.y1:.1f}, area={bottom_area:.1f}")
                 
-                # If text is on the right side
-                elif text_rect.x1 > safe_rect.x0 + safe_rect.width * 0.7:
-                    # Text is in right portion of image
-                    new_x1 = text_rect.x0 - margin
-                    if new_x1 > safe_rect.x0:
-                        safe_rect.x1 = new_x1
-                        logger.debug(f"Shrunk image right to x={new_x1:.1f} to avoid text")
-        
-        # Check if the safe_rect is still large enough to be useful
-        if safe_rect.width < 20 or safe_rect.height < 20:
-            logger.warning(f"Safe rerender bbox too small ({safe_rect.width:.1f}x{safe_rect.height:.1f}), "
-                         f"will not rerender")
-            return None
+                # Option 3: Shrink from left (move left edge right to avoid text)
+                left_rect = fitz.Rect(safe_rect)
+                left_rect.x0 = text_rect.x1 + margin
+                if left_rect.x0 < left_rect.x1:
+                    left_area = left_rect.width * left_rect.height
+                    shrink_options.append(('left', left_rect, left_area))
+                    logger.debug(f"  Option: shrink left to x={left_rect.x0:.1f}, area={left_area:.1f}")
+                
+                # Option 4: Shrink from right (move right edge left to avoid text)
+                right_rect = fitz.Rect(safe_rect)
+                right_rect.x1 = text_rect.x0 - margin
+                if right_rect.x1 > right_rect.x0:
+                    right_area = right_rect.width * right_rect.height
+                    shrink_options.append(('right', right_rect, right_area))
+                    logger.debug(f"  Option: shrink right to x={right_rect.x1:.1f}, area={right_area:.1f}")
+                
+                # Choose the option with the largest remaining area
+                if shrink_options:
+                    best_option = max(shrink_options, key=lambda opt: opt[2])
+                    direction, safe_rect, area = best_option
+                    logger.debug(f"  Chose best option: shrink {direction}, area={area:.1f}")
+                else:
+                    # No valid shrink options - text covers entire image
+                    logger.warning(f"No valid shrink options for overlapping text")
+                    return None
         
         # Check if we actually shrunk the rect
         if safe_rect != img_rect:
+            # We shrunk the rect - check if minor overlap tolerance applies
+            if allow_minor_overlap and total_overlap_area > 0:
+                image_area = img_rect.width * img_rect.height
+                overlap_ratio = total_overlap_area / image_area if image_area > 0 else 0
+                
+                if overlap_ratio <= overlap_threshold:
+                    # Minor overlap is acceptable - use original rect
+                    logger.info(f"Allowing minor text overlap ({overlap_ratio*100:.1f}% < {overlap_threshold*100:.0f}%) "
+                              f"for quality enhancement: {len(overlapping_texts)} texts, "
+                              f"total {total_overlap_area:.1f} pt² overlap")
+                    for text, area in overlapping_texts[:3]:
+                        logger.debug(f"  Overlapping: '{text}' ({area:.1f} pt²)")
+                    return img_rect  # Use original rect
+            
+            # Overlap is significant - use shrunk rect
             logger.info(f"Calculated safe rerender bbox: "
                       f"original ({img_rect.x0:.1f}, {img_rect.y0:.1f}, {img_rect.x1:.1f}, {img_rect.y1:.1f}), "
                       f"safe ({safe_rect.x0:.1f}, {safe_rect.y0:.1f}, {safe_rect.x1:.1f}, {safe_rect.y1:.1f})")
+            
+            # Check if the shrunk rect is still large enough
+            if safe_rect.width < 20 or safe_rect.height < 20:
+                logger.warning(f"Safe rerender bbox too small ({safe_rect.width:.1f}x{safe_rect.height:.1f}), "
+                             f"will not rerender")
+                return None
+            
             return safe_rect
         else:
             # No overlap, safe to rerender entire image
             return img_rect
+    
+    def _check_background_for_header_footer(self, page: fitz.Page, rect: fitz.Rect, 
+                                            page_num: int, region: str) -> bool:
+        """
+        Intelligently check if a background image contains important header or footer content.
+        
+        Uses smart content analysis to distinguish decorative elements from actual content:
+        - Detects text elements (excluding page numbers)
+        - Detects vector shapes (lines, rectangles, etc.)
+        - Uses dynamic boundary detection based on actual content position
+        
+        Args:
+            page: PyMuPDF page object
+            rect: Rectangle of the background image
+            page_num: Page number
+            region: 'header' or 'footer'
+            
+        Returns:
+            True if the region contains non-decorative content (excluding page numbers)
+        """
+        page_height = page.rect.height
+        page_width = page.rect.width
+        
+        # STEP 1: Extract all text elements from the page
+        text_dict = page.get_text("dict")
+        text_elements = []
+        
+        for block in text_dict.get("blocks", []):
+            if block.get("type") == 0:  # Text block
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        bbox = span.get("bbox", [0, 0, 0, 0])
+                        text = span.get("text", "").strip()
+                        if text:
+                            text_elements.append({
+                                'text': text,
+                                'y': bbox[1],
+                                'y2': bbox[3],
+                                'bbox': bbox
+                            })
+        
+        # STEP 2: Detect page numbers (pattern: N/M or just N)
+        # Page numbers are typically centered, small, at very bottom/top
+        def is_page_number(elem):
+            text = elem['text']
+            # Pattern 1: "N/M" format (e.g., "6/10", "1/10")
+            if re.match(r'^\d+/\d+$', text):
+                return True
+            # Pattern 2: Single number at extreme edge
+            if text.isdigit():
+                bbox = elem['bbox']
+                x_center = (bbox[0] + bbox[2]) / 2
+                # Check if centered horizontally (middle 20% of page)
+                is_centered = 0.4 * page_width < x_center < 0.6 * page_width
+                # Check if at extreme top or bottom
+                is_extreme_top = elem['y'] < page_height * 0.05
+                is_extreme_bottom = elem['y'] > page_height * 0.95
+                return is_centered and (is_extreme_top or is_extreme_bottom)
+            return False
+        
+        page_numbers = [elem for elem in text_elements if is_page_number(elem)]
+        non_page_text = [elem for elem in text_elements if not is_page_number(elem)]
+        
+        # STEP 3: Find content boundaries dynamically
+        # Determine where actual content starts/ends based on text distribution
+        if not non_page_text:
+            # No actual text content, check for shapes
+            drawings = page.get_drawings()
+            if not drawings:
+                return False  # No content at all
+            
+            # Use shape positions
+            y_positions = [d.get('rect').y0 for d in drawings if d.get('rect')]
+            if not y_positions:
+                return False
+        else:
+            y_positions = [elem['y'] for elem in non_page_text]
+        
+        y_positions.sort()
+        
+        # Find content region boundaries
+        # Content starts at first non-page-number element
+        # Content ends at last non-page-number element
+        content_top = y_positions[0] if y_positions else 0
+        content_bottom = y_positions[-1] if y_positions else page_height
+        
+        # STEP 4: Define header/footer region intelligently
+        if region == 'header':
+            # Header: from page top to first content
+            # BUT: Must have sufficient gap (at least 20pt) from content
+            header_threshold = content_top - 5  # 5pt buffer
+            
+            # Check if there are shapes or text in the header area
+            header_shapes = [d for d in page.get_drawings() 
+                           if d.get('rect') and d.get('rect').y0 < header_threshold]
+            header_text = [elem for elem in non_page_text if elem['y'] < header_threshold]
+            
+            has_header_content = len(header_shapes) > 0 or len(header_text) > 0
+            
+            if has_header_content:
+                logger.info(f"Page {page_num} header: found {len(header_shapes)} shapes, "
+                          f"{len(header_text)} text elements above y={header_threshold:.1f}")
+            
+            return has_header_content
+            
+        elif region == 'footer':
+            # Footer: from last content to page bottom
+            # BUT: Must have sufficient gap (at least 15pt) from content
+            # AND: Must exclude table content that's close to bottom
+            
+            # Find the last significant content Y position
+            # Exclude elements that are too close to page bottom (likely page numbers)
+            significant_content = [y for y in y_positions if y < page_height * 0.90]
+            
+            if significant_content:
+                content_bottom = significant_content[-1]
+            
+            # Footer region starts after a gap from last content
+            footer_threshold = content_bottom + 10  # 10pt buffer
+            
+            # CRITICAL: Check if there's actual table/list content near the bottom
+            # Tables/lists have multiple rows with consistent patterns
+            near_bottom_text = [elem for elem in non_page_text 
+                              if elem['y'] > page_height * 0.75]
+            
+            if len(near_bottom_text) >= 3:
+                # Multiple text elements near bottom - check if this is table content
+                # Strategy: Look for rows with similar Y positions (table rows)
+                # Group text by Y position (within 2pt tolerance)
+                y_positions = sorted(set(round(e['y'], 0) for e in near_bottom_text))
+                
+                # If we have multiple distinct rows (3+), it's likely a table
+                if len(y_positions) >= 3:
+                    # Check if the last content item is close to bottom (within 15% of page)
+                    last_y = y_positions[-1]
+                    if last_y > page_height * 0.85:
+                        logger.info(f"Page {page_num} detected table/list content near bottom "
+                                  f"({len(y_positions)} rows, last at y={last_y:.1f}), "
+                                  f"skipping footer extraction")
+                        return False  # This is table content, not footer
+            
+            # Check for shapes in the footer area (decorative elements)
+            footer_shapes = [d for d in page.get_drawings() 
+                           if d.get('rect') and d.get('rect').y1 > footer_threshold]
+            
+            # Filter out page number text
+            footer_text = [elem for elem in non_page_text if elem['y'] > footer_threshold]
+            
+            # Footer has content if there are shapes (decorative lines, gradients)
+            # BUT NOT if there's significant text (that would be actual content)
+            has_footer_shapes = len(footer_shapes) > 0
+            has_footer_text = len(footer_text) > 0
+            
+            # Accept footer if it has shapes but no significant text
+            # OR if it has very minimal text (1-2 words, likely decorative)
+            has_footer_content = has_footer_shapes and not has_footer_text
+            
+            if has_footer_content:
+                logger.info(f"Page {page_num} footer: found {len(footer_shapes)} shapes, "
+                          f"{len(footer_text)} text elements below y={footer_threshold:.1f}")
+            
+            return has_footer_content
+        
+        return False
+    
+    def _add_alpha_channel_to_png(self, pil_image: Image.Image) -> Image.Image:
+        """
+        Add alpha channel to RGB PNG image by making black pixels transparent.
+        
+        This method is used for PNG images that lost their alpha channel during PDF conversion.
+        Black pixels (RGB < 30) are converted to transparent.
+        
+        IMPORTANT: This is image processing on the original XObject, NOT page rendering.
+        The original XObject never contains text, so this method won't capture text.
+        
+        CRITICAL FIX: Preserve DPI information to prevent python-pptx from resampling
+        the image during insertion, which can cause color distortion.
+        
+        Args:
+            pil_image: PIL Image in RGB mode
+            
+        Returns:
+            PIL Image in RGBA mode with alpha channel
+        """
+        if pil_image.mode == 'RGBA':
+            # Already has alpha
+            return pil_image
+        
+        # CRITICAL: Save original DPI information before processing
+        original_dpi = pil_image.info.get('dpi', (72, 72))
+        
+        # Convert RGB to RGBA
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+        
+        # Add alpha channel
+        import numpy as np
+        img_array = np.array(pil_image)
+        
+        # Create alpha channel (255 = opaque)
+        alpha = np.ones((img_array.shape[0], img_array.shape[1]), dtype=np.uint8) * 255
+        
+        # Make black pixels transparent (R,G,B < 30 → alpha = 0)
+        black_mask = np.all(img_array < 30, axis=2)
+        alpha[black_mask] = 0
+        
+        # Combine RGB + Alpha
+        rgba_array = np.dstack((img_array, alpha))
+        
+        # Convert back to PIL Image
+        result_image = Image.fromarray(rgba_array, mode='RGBA')
+        
+        # CRITICAL: Restore DPI information to prevent resampling
+        result_image.info['dpi'] = original_dpi
+        
+        return result_image
+    
+    def _convert_white_bg_to_transparent(self, pil_image: Image.Image) -> Image.Image:
+        """
+        Convert white background to transparent for RGB PNG images.
+        
+        This method is used for PNG images with white backgrounds that should be transparent
+        (e.g., rendered graphics, diagrams). White pixels (RGB > 240) are converted to transparent.
+        
+        IMPORTANT: This is image processing on the original XObject, NOT page rendering.
+        The original XObject never contains text, so this method won't capture text.
+        
+        CRITICAL FIX: Preserve DPI information to prevent python-pptx from resampling
+        the image during insertion, which can cause color distortion.
+        
+        Args:
+            pil_image: PIL Image in RGB mode
+            
+        Returns:
+            PIL Image in RGBA mode with transparent white background
+        """
+        # CRITICAL: Save original DPI information before processing
+        original_dpi = pil_image.info.get('dpi', (72, 72))
+        
+        if pil_image.mode == 'RGBA':
+            # Already has alpha - convert white to transparent
+            import numpy as np
+            img_array = np.array(pil_image)
+            
+            # Make white pixels transparent (R,G,B > 240 → alpha = 0)
+            white_mask = np.all(img_array[:, :, :3] > 240, axis=2)
+            img_array[:, :, 3][white_mask] = 0
+            
+            result_image = Image.fromarray(img_array, mode='RGBA')
+            # CRITICAL: Restore DPI information
+            result_image.info['dpi'] = original_dpi
+            return result_image
+        
+        # Convert RGB to RGBA
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+        
+        # Add alpha channel
+        import numpy as np
+        img_array = np.array(pil_image)
+        
+        # Create alpha channel (255 = opaque)
+        alpha = np.ones((img_array.shape[0], img_array.shape[1]), dtype=np.uint8) * 255
+        
+        # Make white pixels transparent (R,G,B > 240 → alpha = 0)
+        white_mask = np.all(img_array > 240, axis=2)
+        alpha[white_mask] = 0
+        
+        # Combine RGB + Alpha
+        rgba_array = np.dstack((img_array, alpha))
+        
+        # Convert back to PIL Image
+        result_image = Image.fromarray(rgba_array, mode='RGBA')
+        
+        # CRITICAL: Restore DPI information to prevent resampling
+        result_image.info['dpi'] = original_dpi
+        
+        return result_image
+    
+    def _extract_header_footer_from_background(self, page: fitz.Page, rect: fitz.Rect, 
+                                               page_num: int, region: str) -> Dict[str, Any]:
+        """
+        Intelligently extract header or footer region using dynamic content boundaries.
+        
+        This method dynamically calculates extraction region based on actual content position,
+        excluding page numbers and avoiding capturing table content.
+        
+        Args:
+            page: PyMuPDF page object
+            rect: Rectangle of the background image
+            page_num: Page number
+            region: 'header' or 'footer'
+            
+        Returns:
+            Image element dictionary, or None if extraction fails
+        """
+        page_height = page.rect.height
+        page_width = page.rect.width
+        
+        # STEP 1: Extract text to find content boundaries
+        text_dict = page.get_text("dict")
+        text_elements = []
+        for block in text_dict.get("blocks", []):
+            if block.get("type") == 0:
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        bbox = span.get("bbox", [0, 0, 0, 0])
+                        text = span.get("text", "").strip()
+                        if text:
+                            text_elements.append({'text': text, 'y': bbox[1], 'bbox': bbox})
+        
+        # STEP 2: Filter out page numbers
+        def is_page_number(elem):
+            text = elem['text']
+            if re.match(r'^\d+/\d+$', text):
+                return True
+            if text.isdigit():
+                bbox = elem['bbox']
+                x_center = (bbox[0] + bbox[2]) / 2
+                is_centered = 0.4 * page_width < x_center < 0.6 * page_width
+                is_extreme_edge = elem['y'] < page_height * 0.05 or elem['y'] > page_height * 0.95
+                return is_centered and is_extreme_edge
+            return False
+        
+        non_page_text = [e for e in text_elements if not is_page_number(e)]
+        
+        # STEP 3: Find content boundaries
+        if non_page_text:
+            y_positions = sorted([e['y'] for e in non_page_text])
+            content_top = y_positions[0]
+            content_bottom = y_positions[-1]
+        else:
+            drawings = page.get_drawings()
+            y_positions = [d.get('rect').y0 for d in drawings if d.get('rect')]
+            if not y_positions:
+                return None
+            y_positions.sort()
+            content_top = y_positions[0]
+            content_bottom = y_positions[-1]
+        
+        # STEP 4: Define extraction region intelligently
+        if region == 'header':
+            extract_rect = fitz.Rect(0, 0, page_width, min(content_top - 2, page_height * 0.15))
+            if extract_rect.height < 10:
+                logger.debug(f"Header region too small, skipping")
+                return None
+        elif region == 'footer':
+            significant_y = [y for y in y_positions if y < page_height * 0.90]
+            if significant_y:
+                content_bottom = significant_y[-1]
+            footer_start = max(content_bottom + 10, page_height * 0.85)
+            extract_rect = fitz.Rect(0, footer_start, page_width, page_height)
+            if extract_rect.height < 8:
+                logger.debug(f"Footer region too small, skipping")
+                return None
+        else:
+            return None
+        
+        try:
+            # Render at high resolution for quality
+            zoom = 3.0
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, clip=extract_rect, alpha=True)
+            
+            # Convert to bytes
+            image_data = pix.tobytes("png")
+            
+            # Get image dimensions
+            img = Image.open(io.BytesIO(image_data))
+            width_px = img.width
+            height_px = img.height
+            
+            # Create image element
+            image_elem = {
+                'type': 'image',
+                'image_data': image_data,
+                'image_format': 'png',
+                'width_px': width_px,
+                'height_px': height_px,
+                'x': extract_rect.x0,
+                'y': extract_rect.y0,
+                'x2': extract_rect.x1,
+                'y2': extract_rect.y1,
+                'width': extract_rect.width,
+                'height': extract_rect.height,
+                'image_id': f"page{page_num}_{region}",
+                'is_header_footer': True,
+                'region_type': region
+            }
+            
+            logger.info(f"Extracted {region} from background at page {page_num}: "
+                       f"{width_px}x{height_px}px, position ({extract_rect.x0:.1f}, {extract_rect.y0:.1f})")
+            
+            return image_elem
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract {region} from background: {e}")
+            return None
+    
+    def _filter_page_numbers_in_screenshots(self, text_elements: List[Dict[str, Any]], 
+                                            header_footer_regions: List[Dict[str, Any]], 
+                                            page: fitz.Page) -> List[Dict[str, Any]]:
+        """
+        Filter out page number text boxes that fall within header/footer screenshot regions.
+        
+        When we take header/footer screenshots, they include page numbers. We need to prevent
+        creating separate text boxes for those page numbers to avoid duplication.
+        
+        Args:
+            text_elements: List of text elements
+            header_footer_regions: List of header/footer screenshot regions with bbox
+            page: PyMuPDF page object
+            
+        Returns:
+            Filtered list of text elements with page numbers in screenshots removed
+        """
+        if not header_footer_regions:
+            # No header/footer screenshots, return all text elements
+            return text_elements
+        
+        page_width = page.rect.width
+        page_height = page.rect.height
+        
+        # Define page number detection function (same logic as in header/footer detection)
+        def is_page_number(elem):
+            text = elem.get('content', '').strip()
+            if not text:
+                return False
+            
+            # Pattern 1: "N/M" format (e.g., "6/10", "1/10")
+            if re.match(r'^\d+/\d+$', text):
+                return True
+            
+            # Pattern 2: Single number at extreme edge (centered)
+            if text.isdigit():
+                x = elem.get('x', 0)
+                x2 = elem.get('x2', 0)
+                y = elem.get('y', 0)
+                
+                x_center = (x + x2) / 2
+                is_centered = 0.4 * page_width < x_center < 0.6 * page_width
+                is_extreme_top = y < page_height * 0.05
+                is_extreme_bottom = y > page_height * 0.95
+                
+                return is_centered and (is_extreme_top or is_extreme_bottom)
+            
+            return False
+        
+        # Check if a text element overlaps with any header/footer region
+        def overlaps_with_region(elem, regions):
+            elem_bbox = (elem['x'], elem['y'], elem['x2'], elem['y2'])
+            
+            for region in regions:
+                region_bbox = region['bbox']
+                
+                # Check if text element center is within the region
+                elem_center_x = (elem_bbox[0] + elem_bbox[2]) / 2
+                elem_center_y = (elem_bbox[1] + elem_bbox[3]) / 2
+                
+                if (region_bbox[0] <= elem_center_x <= region_bbox[2] and
+                    region_bbox[1] <= elem_center_y <= region_bbox[3]):
+                    return True, region['type']
+            
+            return False, None
+        
+        # Filter out page numbers that are within header/footer screenshot regions
+        filtered_elements = []
+        filtered_count = 0
+        
+        for elem in text_elements:
+            if elem.get('type') != 'text':
+                filtered_elements.append(elem)
+                continue
+            
+            if is_page_number(elem):
+                overlaps, region_type = overlaps_with_region(elem, header_footer_regions)
+                if overlaps:
+                    # This page number is within a header/footer screenshot, filter it out
+                    logger.info(f"Filtering page number '{elem.get('content')}' at y={elem.get('y'):.1f} "
+                              f"(already included in {region_type} screenshot)")
+                    filtered_count += 1
+                    continue
+            
+            filtered_elements.append(elem)
+        
+        if filtered_count > 0:
+            logger.info(f"Filtered {filtered_count} page number text box(es) to prevent duplication with screenshots")
+        
+        return filtered_elements
     
     def __enter__(self):
         """Context manager entry."""

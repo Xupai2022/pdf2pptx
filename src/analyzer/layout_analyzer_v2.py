@@ -182,6 +182,8 @@ class LayoutAnalyzerV2:
         text_elements = ElementExtractor.get_text_elements(page_data)
         image_elements = ElementExtractor.get_image_elements(page_data)
         shape_elements = ElementExtractor.get_shape_elements(page_data)
+        # NEW: Extract table elements
+        table_elements = [e for e in elements if e.get('type') == 'table']
         
         layout_regions = []
         
@@ -192,31 +194,37 @@ class LayoutAnalyzerV2:
             width = shape_elem['width']
             height = shape_elem['height']
             
+            # CRITICAL: Use PDF drawing order (pdf_index) as the primary z-index
+            # In PDF, elements drawn later appear on top
+            # This preserves the correct layering for bar charts, gridlines, etc.
+            pdf_index = shape_elem.get('pdf_index', 0)
+            
             # More precise role detection based on HTML specifications
             if shape_area > page_area * 0.5:
                 # Full-page background
                 role = 'background'
-                z_index = -1
+                # Use pdf_index directly for z-index (preserve drawing order)
+                z_index = pdf_index
             elif height < 15 and width > page_width * 0.9:
                 # Thin horizontal bar across top (like top-bar: 10px height, full width)
                 role = 'decoration'
-                z_index = 0
+                z_index = pdf_index
             elif width < 10 and height > 50:
                 # Narrow vertical strip (like border-left: 4px solid)
                 role = 'border'
-                z_index = 0
+                z_index = pdf_index
             elif width > 20 and height > 20 and width < 80 and height < 50:
                 # Small rectangles (like risk badges)
                 role = 'decoration'
-                z_index = 1
+                z_index = pdf_index
             elif width > 200 and height > 50:
                 # Large rectangles (like card backgrounds)
                 role = 'card_background'
-                z_index = 0
+                z_index = pdf_index
             else:
                 # Default to decoration for other shapes
                 role = 'decoration'
-                z_index = 0
+                z_index = pdf_index
             
             layout_regions.append({
                 'role': role,
@@ -225,13 +233,42 @@ class LayoutAnalyzerV2:
                 'z_index': z_index
             })
         
+        # Process tables (tables should appear above shapes but below text)
+        # Tables are complete structures that render as official PPT table objects
+        for table_elem in table_elements:
+            # Tables render above shapes (z_index=5000), but below regular images and text
+            z_index = 5000
+            
+            layout_regions.append({
+                'role': 'table',
+                'bbox': [table_elem['x'], table_elem['y'], table_elem['x2'], table_elem['y2']],
+                'elements': [table_elem],
+                'z_index': z_index
+            })
+        
         # Process images
+        # CRITICAL FIX: Full-page background images must render on the BOTTOM layer
+        # Regular images appear on top of shapes, with z_index=10000
+        # Background images (is_full_page_background=True OR is_background=True) use z_index=-1000 to render below everything
         for img_elem in image_elements:
+            # Check if this is a full-page background image (from either marking)
+            is_full_page_background = img_elem.get('is_full_page_background', False)
+            is_background = img_elem.get('is_background', False)
+            
+            if is_full_page_background or is_background:
+                # Background images go to the BOTTOM layer (below shapes and text)
+                # Use element's z_index if specified, otherwise use -1000
+                z_index = img_elem.get('z_index', -1000)
+                logger.info(f"Full-page background image assigned z_index={z_index} (bottom layer)")
+            else:
+                # Regular images appear on top of shapes
+                z_index = 10000
+            
             layout_regions.append({
                 'role': 'image',
                 'bbox': [img_elem['x'], img_elem['y'], img_elem['x2'], img_elem['y2']],
                 'elements': [img_elem],
-                'z_index': 1
+                'z_index': z_index
             })
         
         # Group text elements by spatial proximity AND style similarity
@@ -439,7 +476,30 @@ class LayoutAnalyzerV2:
                 
                 # Group if on same line and close horizontal proximity
                 # Use content-aware merging to prevent overlaps
-                if y_diff <= self.group_tolerance:
+                # CRITICAL FIX: Also check if they're on ACTUALLY the same line
+                # by comparing if their Y ranges overlap significantly
+                # This prevents merging text from adjacent lines that have tiny Y gaps (e.g., 0.02pt)
+                elem_y2 = elem.get('y2', elem_y)
+                other_y2 = other.get('y2', other_y)
+                
+                # Calculate vertical overlap
+                y_overlap_start = max(elem_y, other_y)
+                y_overlap_end = min(elem_y2, other_y2)
+                y_overlap = max(0, y_overlap_end - y_overlap_start)
+                
+                # Get the average height of the two elements
+                elem_height = elem_y2 - elem_y
+                other_height = other_y2 - other_y
+                avg_height = (elem_height + other_height) / 2
+                
+                # Elements are on the same line if:
+                # 1. y_diff <= group_tolerance (vertical centers are close)
+                # 2. AND they have significant vertical overlap (>30% of average height)
+                # This prevents merging lines that just happen to be vertically close
+                are_on_same_line = (y_diff <= self.group_tolerance and 
+                                   (y_overlap > avg_height * 0.3 or y_diff <= 1.0))
+                
+                if are_on_same_line:
                     should_group = False
                     merge_reason = ""
                     
@@ -554,7 +614,7 @@ class LayoutAnalyzerV2:
                 'bbox': bbox,
                 'elements': group_elements,
                 'text': text_content,
-                'z_index': 2
+                'z_index': 20000  # Text should appear on top of shapes and images
             })
         
         return regions

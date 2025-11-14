@@ -124,6 +124,24 @@ class SlideModel:
         self.add_element(element)
         return element
     
+    def add_table(self, table_content: Dict[str, Any], position: Dict[str, float], 
+                  z_index: int = 0) -> SlideElement:
+        """
+        Add a table element to the slide.
+        
+        Args:
+            table_content: Table content dictionary with 'grid', 'rows', 'cols'
+            position: Position dictionary
+            z_index: Z-index for layering
+            
+        Returns:
+            Created SlideElement
+        """
+        element = SlideElement('table', position, table_content, {})
+        element.z_index = z_index
+        self.add_element(element)
+        return element
+    
     def set_title(self, title: str):
         """Set the slide title."""
         self.title = title

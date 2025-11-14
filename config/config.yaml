@@ -24,19 +24,20 @@ analyzer:
 
 # Coordinate Mapping Configuration
 rebuilder:
-  # PowerPoint uses 72 DPI standard
-  # Target slide size: 1920×1080 px (16:9 standard)
-  slide_width: 26.667  # inches (1920px at 72 DPI = 1920/72 = 26.667")
-  slide_height: 15.0  # inches (1080px at 72 DPI = 1080/72 = 15")
+  # PowerPoint slide dimensions (will be auto-adjusted to match PDF dimensions)
+  # These are initial defaults, but actual dimensions will be set to match each PDF's size
+  # This ensures 1:1 scale: PDF 18pt font → PPT 18pt font
+  slide_width: 20.0  # inches (default, will be overridden)
+  slide_height: 11.25  # inches (default, will be overridden)
   margin_left: 0.0  # No margins to match HTML exactly
   margin_right: 0.0
   margin_top: 0.0
   margin_bottom: 0.0
 
-  # PDF scale correction: NOW CALCULATED DYNAMICALLY based on PDF dimensions
-  # The system automatically calculates the appropriate scale factor
-  # for each PDF to ensure consistent visual sizing
-  pdf_to_html_scale: 1.333  # Default fallback (used only if dynamic calculation fails)
+  # PDF scale correction: NOW FIXED AT 1.0 for exact size preservation
+  # No scaling is applied - PDF dimensions map directly to PPT dimensions
+  # This preserves font sizes, image sizes, and all element proportions exactly as in PDF
+  pdf_to_html_scale: 1.0  # Fixed at 1:1 scale
 
   # Border width correction: PDF has 5.55pt borders → 7.4pt after scaling, but HTML expects 4pt
   # Correction factor: 4pt / 7.4pt = 0.54
@@ -74,11 +75,11 @@ mapper:
   default_font_size: 18
   title_font_size: 32
 
-  # Font size scaling: NOW DYNAMICALLY MATCHES coordinate scaling
-  # The system automatically adjusts font size scale to match the
-  # coordinate scaling, ensuring consistent visual appearance
-  # across PDFs of different dimensions
-  font_size_scale: 1.333  # Default fallback (will be overridden dynamically)
+  # Font size scaling: NOW FIXED AT 1.0 for exact font size preservation
+  # With 1:1 coordinate scaling, font sizes are also preserved exactly
+  # PDF 18pt → PPT 18pt (no change)
+  # This ensures fonts appear the same size as in the original PDF
+  font_size_scale: 1.0  # Fixed at 1:1 scale
   
   # Color schemes
   preserve_colors: true

@@ -584,6 +584,14 @@ class ShapeMerger:
                 aspect = self._get_aspect_ratio(shape)
                 stroke_width = shape.get('stroke_width', 1.0)
                 
+                # CRITICAL FIX: Do NOT filter white stroke shapes (they are chart grid lines)
+                # Pie charts often have white grid lines overlaid on colored sectors
+                # These should be preserved as they are part of the chart visualization
+                if stroke_color and stroke_color.upper() in ['#FFFFFF', '#FFF']:
+                    logger.debug(f"Keeping white stroke shape at ({shape['x']:.1f}, {shape['y']:.1f}) - "
+                               f"likely chart grid lines")
+                    continue
+                
                 # Only filter if aspect ratio is near circular (0.8-1.2)
                 # This ensures we don't filter elongated shapes that might be valid
                 if 0.8 <= aspect <= 1.2:
