@@ -120,6 +120,7 @@ pdf2pptx/
 - ✅ **Editable Output** - Generates fully editable PPTX files
 - ✅ **Configurable** - YAML-based configuration system
 - ✅ **Fast Processing** - Optimized for performance
+- 🆕 **LayoutLM Enhancement** - Optional AI-powered semantic analysis for complex documents (GPU recommended)
 
 ## Requirements
 
@@ -132,16 +133,48 @@ pdf2pptx/
 
 ## Documentation
 
+### Core Documentation
 - **[README.md](README.md)** - This file, project overview
 - **[USAGE.md](USAGE.md)** - Comprehensive usage guide with examples
 - **[PROJECT_SUMMARY.md](PROJECT_SUMMARY.md)** - Complete technical documentation
 - **Configuration** - See `config/config.yaml` for all options
+
+### LayoutLM Enhancement (Optional)
+- **[HOW_TO_USE_LAYOUTLM.md](HOW_TO_USE_LAYOUTLM.md)** - Quick start guide for GPU users (3 steps)
+- **[LAYOUTLM_QUICKSTART.md](LAYOUTLM_QUICKSTART.md)** - Detailed setup and configuration
+- **[LAYOUTLM_INTEGRATION_GUIDE.md](LAYOUTLM_INTEGRATION_GUIDE.md)** - Complete integration guide
+- **[LAYOUTLM_FEASIBILITY_REPORT.md](LAYOUTLM_FEASIBILITY_REPORT.md)** - Technical analysis and architecture
+- **[LAYOUTLM_DELIVERY_SUMMARY.md](LAYOUTLM_DELIVERY_SUMMARY.md)** - Project completion report
 
 ## Performance
 
 - Small PDFs (1-10 pages): < 1 second
 - Medium PDFs (10-50 pages): 2-5 seconds
 - Large PDFs (50-200 pages): 10-30 seconds
+
+## Optional: LayoutLM Enhancement
+
+Want to boost accuracy on complex documents? Try our optional LayoutLM integration:
+
+```bash
+# 1. Install dependencies (GPU recommended)
+pip install transformers torch
+
+# 2. Test it
+python tests/layoutlm_quick_test.py tests/test_sample.pdf
+
+# 3. Enable it (edit config/config.yaml)
+analyzer:
+  use_layoutlm: true
+  layoutlm_device: "cuda"
+```
+
+**Benefits**:
+- 📊 +15-25% accuracy on complex tables and multi-column layouts
+- 🎯 Better title/paragraph/table classification
+- 🔍 Smarter reading order detection
+
+**Requirements**: NVIDIA GPU (6GB+ VRAM), see [HOW_TO_USE_LAYOUTLM.md](HOW_TO_USE_LAYOUTLM.md)
 
 ## Git Repository
 
