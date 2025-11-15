@@ -888,18 +888,40 @@ class PDFParser:
                             image_bytes = img_io.getvalue()
                             logger.info(f"White-to-transparent conversion complete: {pil_image.width}x{pil_image.height}px, mode={pil_image.mode}, DPI={dpi}")
                     
+                    # CRITICAL FIX: Normalize coordinates for full-page background images
+                    # Full-page backgrounds should start at (0, 0) to prevent negative offsets
+                    # that cause layout issues in the final PPTX
+                    if is_full_page_background:
+                        # For full-page backgrounds, normalize to (0, 0) and use page dimensions
+                        x = 0
+                        y = 0
+                        x2 = page.rect.width
+                        y2 = page.rect.height
+                        width = page.rect.width
+                        height = page.rect.height
+                        logger.debug(f"Normalized full-page background coordinates from "
+                                   f"({rect.x0:.2f}, {rect.y0:.2f}) to (0, 0)")
+                    else:
+                        # For regular images, use actual rect coordinates
+                        x = rect.x0
+                        y = rect.y0
+                        x2 = rect.x1
+                        y2 = rect.y1
+                        width = rect.width
+                        height = rect.height
+
                     element = {
                         'type': 'image',
                         'image_data': image_bytes,
                         'image_format': image_ext,
                         'width_px': pil_image.width,
                         'height_px': pil_image.height,
-                        'x': rect.x0,
-                        'y': rect.y0,
-                        'x2': rect.x1,
-                        'y2': rect.y1,
-                        'width': rect.width,
-                        'height': rect.height,
+                        'x': x,
+                        'y': y,
+                        'x2': x2,
+                        'y2': y2,
+                        'width': width,
+                        'height': height,
                         'image_id': f"page{page_num}_img{img_index}",
                         'was_rerendered': (quality_status == 'rerender' or needs_large_image_enhancement),
                         'is_full_page_background': is_full_page_background  # Mark for bottom layer rendering
