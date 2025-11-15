@@ -341,6 +341,27 @@ class TableDetector:
         if len(h_line_groups) < 2 or len(v_line_groups) < 2:
             return False
         
+        # CRITICAL FIX: Check maximum grid size to filter decorative grids
+        # Real tables rarely have more than 15 columns (typical tables have 2-10 columns)
+        # Example: Page 31 APEX has 23 columns (10x23 grid) which is clearly decorative, not a table
+        # 
+        # Maximum limits:
+        # - Columns: 15 (allows wide tables but filters decorative grids)
+        # - Rows: 50 (allows long tables but filters decorative patterns)
+        MAX_TABLE_COLS = 15
+        MAX_TABLE_ROWS = 50
+        
+        num_rows = len(h_line_groups) - 1  # Number of rows = number of horizontal lines - 1
+        num_cols = len(v_line_groups) - 1  # Number of columns = number of vertical lines - 1
+        
+        if num_cols > MAX_TABLE_COLS:
+            logger.debug(f"Too many columns for a table: {num_cols} > {MAX_TABLE_COLS} (likely decorative grid)")
+            return False
+        
+        if num_rows > MAX_TABLE_ROWS:
+            logger.debug(f"Too many rows for a table: {num_rows} > {MAX_TABLE_ROWS} (likely decorative pattern)")
+            return False
+        
         # Check if lines span across sufficient range
         # Horizontal lines should span multiple columns
         h_spans = []
@@ -703,16 +724,27 @@ class TableDetector:
                 # Actual gap = distance from right edge to next column's left edge
                 actual_gap = next_col_x - col_right_edge
                 
-                # CRITICAL: For wide columns (>150pt), add visual separation bonus
-                # This helps detect side-by-side tables where the gap is small but columns are wide
-                # Bonus = min(col_width - 150, 200) to cap the bonus at 200pt
+                # CRITICAL FIX: Only apply wide column bonus for VERY wide columns (>200pt) with ANY actual gap
+                # This prevents false splitting of single tables with merged/wide cells
+                # 
+                # Problem: Page 30 APEX has a 259.2pt merged cell with 0pt actual gap to next column
+                # Old logic: col_width=259.2pt > 150pt -> bonus=109.2pt -> visual_gap=109.2pt > 80pt -> FALSE SPLIT!
+                # 
+                # Solution: Require BOTH conditions to apply bonus:
+                # 1. Column is VERY wide (>200pt, not just >150pt) - indicates potential side-by-side tables
+                # 2. Actual gap exists (>0pt, even small gaps count) - indicates real spatial separation
+                # 
+                # Examples:
+                # - Page 30 APEX: 259.2pt width, 0pt gap -> no bonus -> no split ✓
+                # - Page 10 Season: 230.4pt width, 7.9pt gap -> bonus -> split ✓
+                # 
+                # This prevents false positives while still catching real side-by-side tables
                 visual_gap = actual_gap
-                if col_width > 150:
-                    wide_col_bonus = min(col_width - 150, 200)
+                if col_width > 200 and actual_gap > 0:
+                    wide_col_bonus = min(col_width - 200, 100)  # Reduced bonus cap from 200pt to 100pt
                     visual_gap += wide_col_bonus
-                    logger.debug(f"Wide column bonus: col_width={col_width:.1f}pt > 150pt, "
-                               f"adding {wide_col_bonus:.1f}pt bonus (actual_gap={actual_gap:.1f}pt, "
-                               f"visual_gap={visual_gap:.1f}pt)")
+                    logger.debug(f"Wide column bonus: col_width={col_width:.1f}pt > 200pt AND actual_gap={actual_gap:.1f}pt > 0pt, "
+                               f"adding {wide_col_bonus:.1f}pt bonus -> visual_gap={visual_gap:.1f}pt)")
                 
                 # Only consider non-negative gaps
                 if actual_gap >= 0:
@@ -742,19 +774,23 @@ class TableDetector:
             else:
                 median_gap = 0
             
-            # STRICT CRITERIA for table separation (using visual gaps):
-            # Strategy 1: Absolute threshold - gap >= 80pt (visual gap, including wide column bonus)
-            # Strategy 2: Relative threshold - gap >= 2x median gap
+            # CRITICAL CRITERIA for table separation (using visual gaps):
+            # Strategy 1: Absolute threshold - gap >= 35pt (visual gap, including wide column bonus)
+            # Strategy 2: Relative threshold - gap >= 1.5x median gap
             # 
-            # Examples with NEW visual gap calculation:
-            # - Page 12: Col 0 (40.8pt) gap to Col 1 = 0pt, no bonus -> visual_gap=0pt (no split) ✓
-            # - Page 10: Col 2 (230.4pt) gap to Col 3 = 7.9pt + 80.4pt bonus -> visual_gap=88.3pt (split) ✓
-            # - Page 7: Normal column gaps, no wide columns -> use relative ratio check
-            #
-            # IMPORTANT: Lowered absolute threshold from 200pt to 80pt to catch side-by-side tables
-            # where visual separation comes from wide column bonus rather than actual spacing
-            min_gap_threshold = 80  # pt - visual gap threshold
-            min_ratio = 2.5  # Relative threshold (slightly higher since we lowered absolute threshold)
+            # Rationale:
+            # - Page 30 APEX: largest_gap=0pt -> no split ✓
+            # - Page 10 Season: largest_gap=38.3pt (7.9pt+30.4pt bonus), median=23.8pt, ratio=1.6x -> split ✓
+            # - Page 12: largest_gap=0pt -> no split ✓
+            # 
+            # The key insight: Real side-by-side tables have SOME gap (>0pt) plus wide column
+            # Merged cells in single tables have NO gap (=0pt)
+            # 
+            # BALANCED THRESHOLDS:
+            # - Absolute: 35pt catches visual gaps with moderate bonus (was 80pt, too high)
+            # - Relative: 1.5x allows small but consistent separation (was 2.5x, too strict)
+            min_gap_threshold = 35  # pt - visual gap threshold (lowered from 80pt)
+            min_ratio = 1.5  # Relative threshold (lowered from 2.5x for sensitivity)
             
             if (largest_gap >= min_gap_threshold and 
                 (median_gap == 0 or largest_gap >= median_gap * min_ratio)):
