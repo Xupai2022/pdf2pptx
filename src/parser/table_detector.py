@@ -354,33 +354,54 @@ class TableDetector:
         table = self._build_table_from_lines(h_line_groups, v_line_groups, rectangles, page)
         
         if table:
-            # CRITICAL VALIDATION: Check if table columns form a compact group
-            # Reject tables where columns are scattered across disconnected regions
-            # Example: Page 27 has left chart (X=132-435) + right table (X=462-920)
-            # These should NOT be merged into one table
+            # IMPROVED VALIDATION: Use same multi-criteria detection as _build_table_from_lines
+            # 
+            # Apply consistent gap detection logic to post-build validation
             
             cells = table.get('cells', [])
-            if cells:
+            if cells and len(cells) >= 8:  # Need reasonable cell count for validation
                 # Get all unique column X positions
                 col_x_positions = sorted(set(c['x'] for c in cells))
                 
                 # Calculate gaps between consecutive columns
-                if len(col_x_positions) >= 2:
+                if len(col_x_positions) >= 3:  # Need at least 3 columns for ratio analysis
                     gaps = [col_x_positions[i+1] - col_x_positions[i] 
                            for i in range(len(col_x_positions) - 1)]
                     
-                    # If there's a gap > 20pt between columns, it's likely two separate regions
-                    # CRITICAL: This threshold should be smaller than typical column spacing
-                    # but larger than typical cell borders (which are < 5pt)
                     max_gap = max(gaps) if gaps else 0
-                    median_gap = sorted(gaps)[len(gaps)//2] if gaps else 0
+                    sorted_gaps = sorted(gaps)
                     
-                    # Reject if max gap is > 3x median gap AND > 20pt (indicates discontinuity)
-                    if max_gap > 20 and (median_gap == 0 or max_gap > median_gap * 3):
-                        logger.info(f"Rejected line-based table: columns have large gap "
-                                   f"(max_gap={max_gap:.1f}pt, median={median_gap:.1f}pt), "
-                                   f"likely spans disconnected regions")
-                        return []
+                    # Calculate median of smaller gaps (exclude largest)
+                    if len(gaps) >= 2:
+                        smaller_gaps = sorted_gaps[:-1]
+                        median_gap = smaller_gaps[len(smaller_gaps) // 2] if smaller_gaps else 0
+                        
+                        # STRATEGY 1: Check gap distribution pattern
+                        large_gaps = [g for g in gaps if g >= 100]
+                        large_gap_ratio = len(large_gaps) / len(gaps)
+                        
+                        if max_gap >= 150 and large_gap_ratio < 0.4:
+                            logger.info(f"Post-build validation rejected: max_gap ({max_gap:.1f}pt) is outlier, "
+                                       f"only {large_gap_ratio*100:.0f}% of gaps are large, "
+                                       f"likely spans disconnected regions")
+                            return []
+                        
+                        # STRATEGY 2: Extreme gap with high ratio (only if most gaps are small)
+                        if median_gap > 0 and max_gap >= 300 and max_gap >= median_gap * 3 and large_gap_ratio < 0.5:
+                            logger.info(f"Post-build validation rejected: massive gap with mostly small gaps "
+                                       f"(max_gap={max_gap:.1f}pt >= {median_gap * 3:.1f}pt (3x median), "
+                                       f"large_gap_ratio={large_gap_ratio*100:.0f}%), "
+                                       f"likely spans disconnected regions")
+                            return []
+                        
+                        logger.debug(f"Post-build validation passed: max_gap={max_gap:.1f}pt, "
+                                   f"median={median_gap:.1f}pt, large_gap_ratio={large_gap_ratio*100:.0f}%")
+                    else:
+                        # Only 2 gaps, use simple absolute threshold
+                        if max_gap >= 300:
+                            logger.info(f"Post-build validation rejected: very large gap with insufficient columns "
+                                       f"(max_gap={max_gap:.1f}pt >= 300pt)")
+                            return []
             
             logger.info(f"Detected line-based table: {table['rows']}x{table['cols']} grid")
             return [table]
@@ -511,20 +532,72 @@ class TableDetector:
         row_positions = sorted(h_line_groups.keys())
         col_positions = sorted(v_line_groups.keys())
         
-        # CRITICAL CHECK: Detect horizontal gaps in column positions
-        # If there's a large gap (> 50pt) between columns, it indicates
-        # two separate regions that should NOT be merged into one table
-        if len(col_positions) >= 2:
+        # IMPROVED STRATEGY: Detect horizontal gaps using statistical analysis
+        # instead of fixed threshold
+        # 
+        # Problem: Fixed 50pt threshold rejects valid tables with wide columns
+        # Example: Page 5 has gaps [104, 513, 123, 123] - 513pt is valid for wide table
+        # 
+        # Solution: Use multi-criteria detection combining ratio, absolute value, and distribution
+        # 
+        # CRITICAL CRITERIA for rejection (ANY of the following):
+        # 1. Extreme outlier with large count: max_gap >= 150pt AND < 20% of gaps are large (>100pt)
+        #    Rationale: Page 16 has [32, 32, ..., 115, 115, 115] - many small, few large -> REJECT
+        # 2. Massive gap: max_gap >= 300pt with ratio >= 3x median
+        #    Rationale: Page 27 chart+table scenario
+        # 3. At least 3 columns required (otherwise ratio is unreliable)
+        if len(col_positions) >= 3:
             gaps = [col_positions[i+1] - col_positions[i] 
                    for i in range(len(col_positions) - 1)]
-            max_gap = max(gaps) if gaps else 0
             
-            # If max gap > 50pt, reject this table (likely spans disconnected regions)
-            if max_gap > 50:
-                logger.info(f"Rejected line-based table: columns have large gap "
-                           f"(max_gap={max_gap:.1f}pt), likely spans disconnected regions "
-                           f"(e.g., chart + table)")
-                return None
+            if len(gaps) >= 2:
+                max_gap = max(gaps)
+                sorted_gaps = sorted(gaps)
+                
+                # Calculate median of all gaps EXCEPT the largest one
+                smaller_gaps = sorted_gaps[:-1]
+                
+                if smaller_gaps:
+                    median_gap = smaller_gaps[len(smaller_gaps) // 2]
+                    
+                    # STRATEGY 1: Check gap distribution pattern
+                    # If most gaps are small (<= 100pt) but max_gap is large (>= 150pt),
+                    # it indicates the large gap separates distinct regions
+                    large_gaps = [g for g in gaps if g >= 100]
+                    large_gap_ratio = len(large_gaps) / len(gaps)
+                    
+                    # Page 5: gaps=[104, 513, 123, 123] -> 4 large gaps / 4 total = 100% -> ACCEPT
+                    # Page 16: gaps=[32, 32, ..., 115, 115, 115] -> 4 large / 15 total = 27% -> REJECT
+                    if max_gap >= 150 and large_gap_ratio < 0.4:
+                        logger.info(f"Rejected line-based table: max_gap ({max_gap:.1f}pt) is outlier, "
+                                   f"only {large_gap_ratio*100:.0f}% of gaps are large (>= 100pt), "
+                                   f"likely spans disconnected regions")
+                        return None
+                    
+                    # STRATEGY 2: Extreme gap with high ratio (BUT only if gaps are mostly small)
+                    # Reject if max_gap is massive AND significantly larger than typical spacing
+                    # AND most gaps are small (< 50% are large)
+                    # 
+                    # This ensures we don't reject tables where ALL gaps are large
+                    # (like Page 5 where all gaps are 100-513pt)
+                    if max_gap >= 300 and max_gap >= median_gap * 3 and large_gap_ratio < 0.5:
+                        logger.info(f"Rejected line-based table: massive gap with mostly small gaps "
+                                   f"(max_gap={max_gap:.1f}pt >= {median_gap * 3:.1f}pt (3x median={median_gap:.1f}pt), "
+                                   f"large_gap_ratio={large_gap_ratio*100:.0f}%), "
+                                   f"likely spans disconnected regions")
+                        return None
+                    
+                    # ACCEPTED: Log details for debugging
+                    logger.debug(f"Gap analysis passed: max_gap={max_gap:.1f}pt, median={median_gap:.1f}pt, "
+                               f"ratio={max_gap/median_gap:.1f}x, large_gap_ratio={large_gap_ratio*100:.0f}%, "
+                               f"treating as valid table")
+                else:
+                    # Edge case: only 2 gaps total, use simpler logic
+                    # Reject only if gap is extremely large (>= 300pt)
+                    if max_gap >= 300:
+                        logger.info(f"Rejected line-based table: columns have very large gap "
+                                   f"(max_gap={max_gap:.1f}pt >= 300pt) with insufficient gaps for ratio analysis")
+                        return None
         
         # Build cell grid
         cells = []
