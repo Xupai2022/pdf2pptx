@@ -1,9 +1,0 @@
-Traceback (most recent call last):
-  File "/home/user/webapp/main.py", line 17, in <module>
-    from src.parser.pdf_parser import PDFParser
-  File "/home/user/webapp/src/parser/__init__.py", line 6, in <module>
-    from .pdf_parser import PDFParser
-  File "/home/user/webapp/src/parser/pdf_parser.py", line 5, in <module>
-    import fitz  # PyMuPDF
-    ^^^^^^^^^^^
-ModuleNotFoundError: No module named 'fitz'

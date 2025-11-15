@@ -40,13 +40,14 @@ class PPTXGenerator:
         else:
             self.prs = Presentation()
         
-        # Set slide dimensions from config (1920×1080 = 13.333" × 7.5" at 144 DPI)
+        # CRITICAL: Slide dimensions will be set dynamically based on each PDF's actual size
+        # This happens in add_slide_from_model() when the first slide is added
+        # For now, store config defaults but don't apply them yet
         rebuilder_config = config.get('rebuilder', {})
-        slide_width = rebuilder_config.get('slide_width', 13.333)
-        slide_height = rebuilder_config.get('slide_height', 7.5)
-        self.prs.slide_width = Inches(slide_width)
-        self.prs.slide_height = Inches(slide_height)
-        logger.info(f"Set slide dimensions to {slide_width}\" x {slide_height}\" (1920x1080px at 144 DPI)")
+        self.default_slide_width = rebuilder_config.get('slide_width', 10.0)
+        self.default_slide_height = rebuilder_config.get('slide_height', 7.5)
+        self.slide_dimensions_set = False  # Track if dimensions have been set
+        logger.info(f"PPTXGenerator initialized with default dimensions {self.default_slide_width}\" x {self.default_slide_height}\"")
         
         # Initialize style mapper and element renderer
         self.style_mapper = StyleMapper(config)
@@ -62,6 +63,13 @@ class PPTXGenerator:
         Returns:
             Created slide object
         """
+        # CRITICAL: Set slide dimensions from first slide model (all slides have same PDF dimensions)
+        if not self.slide_dimensions_set:
+            self.prs.slide_width = Inches(slide_model.width)
+            self.prs.slide_height = Inches(slide_model.height)
+            self.slide_dimensions_set = True
+            logger.info(f"Set PPT dimensions to {slide_model.width:.2f}\" x {slide_model.height:.2f}\" (matching PDF size)")
+        
         # Use blank slide layout
         blank_layout = self.prs.slide_layouts[6]  # Blank layout
         slide = self.prs.slides.add_slide(blank_layout)

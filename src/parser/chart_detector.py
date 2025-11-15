@@ -79,7 +79,7 @@ class ChartDetector:
         
         Excludes:
         - Page-wide backgrounds (> 50% of page area)
-        - Tiny decorations (< 5x5 pixels)
+        - Small decorations (< 15x15 pixels)
         - Thin lines spanning entire width/height
         
         Args:
@@ -104,7 +104,10 @@ class ChartDetector:
                 continue
             
             # Skip tiny decorations
-            if width < 5 or height < 5:
+            # CRITICAL FIX: Increase minimum size to filter out small decorative elements
+            # Small icons, bullets, and decorative circles (< 15pt) should not be chart candidates
+            # Real chart elements (pie sectors, bars, etc.) are typically larger
+            if width < 15 or height < 15:
                 continue
             
             # Skip full-width thin lines (borders, headers)

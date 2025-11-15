@@ -200,8 +200,19 @@ class StyleMapper:
                 logger.debug(f"Stroke width: {stroke_width}pt → {scaled_width}pt (scaled)")
             else:
                 # No border - make line transparent/invisible
-                shape.line.fill.background()
-                logger.debug(f"No border: stroke_color={stroke_color}, stroke_width={stroke_width}")
+                # CRITICAL FIX: Only set line.fill.background() if there's NO fill color
+                # For filled shapes (rectangles with fill_color), we should NOT touch the line at all
+                # to preserve the default PowerPoint behavior (no border)
+                # This fixes the issue where gray vertical lines (#383F4E fill) lost their color
+                if fill_color is None or fill_color == 'None':
+                    # Only for truly stroke-only shapes, make line transparent
+                    shape.line.fill.background()
+                    logger.debug(f"No border for stroke-only shape: stroke_color={stroke_color}")
+                else:
+                    # For filled shapes, explicitly set no line to avoid default black border
+                    shape.line.color.rgb = RGBColor(0, 0, 0)  # Workaround: set to black first
+                    shape.line.fill.background()  # Then make it transparent
+                    logger.debug(f"No border for filled shape: fill_color={fill_color}, stroke_color={stroke_color}")
         except Exception as e:
             logger.warning(f"Failed to apply shape style: {e}", exc_info=True)
     

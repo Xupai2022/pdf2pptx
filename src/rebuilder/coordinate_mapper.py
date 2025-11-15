@@ -49,26 +49,52 @@ class CoordinateMapper:
         pdf_width = layout_data.get('width', 0)
         pdf_height = layout_data.get('height', 0)
 
-        # Dynamically calculate PDF to HTML scale based on actual PDF dimensions
-        if pdf_width > 0:
-            # Target width in points (72 DPI = 72 points per inch)
-            target_width_pt = self.slide_width * 72
-            # Calculate scale factor needed to match PDF to target slide width
-            dynamic_scale = target_width_pt / pdf_width
-            # Update the scale factor for this specific PDF
-            self.pdf_to_html_scale = dynamic_scale
-            logger.info(f"Dynamic scale calculation: PDF {pdf_width:.0f}pt → Target {target_width_pt:.0f}pt, scale={dynamic_scale:.3f}")
+        # CRITICAL FIX: Use 1:1 scale to preserve exact PDF dimensions and font sizes
+        # This ensures:
+        # - PDF 18pt font → PPT 18pt font (no size change)
+        # - Images, shapes maintain exact sizes
+        # - No artificial scaling that causes oversized fonts
+        # 
+        # The slide dimensions will automatically match PDF dimensions
+        self.pdf_to_html_scale = 1.0
+        
+        # Update slide dimensions to match PDF (convert pt to inches at 72 DPI)
+        if pdf_width > 0 and pdf_height > 0:
+            self.slide_width = pdf_width / 72.0
+            self.slide_height = pdf_height / 72.0
+            logger.info(f"1:1 scale mode: PDF {pdf_width:.0f}×{pdf_height:.0f}pt → PPT {self.slide_width:.2f}×{self.slide_height:.2f}\" (no scaling)")
         else:
-            logger.warning(f"Invalid PDF width: {pdf_width}, using default scale")
-            self.pdf_to_html_scale = self.config.get('pdf_to_html_scale', 1.333)
+            logger.warning(f"Invalid PDF dimensions: {pdf_width}×{pdf_height}, using config defaults")
+            self.pdf_to_html_scale = 1.0
 
         slide = SlideModel(slide_num, self.slide_width, self.slide_height)
         # Store the scale factor for use by StyleMapper
         slide.scale_factor = self.pdf_to_html_scale
 
-        # Process layout regions
-        for region in layout_data.get('layout', []):
-            self._process_region(region, slide, pdf_width, pdf_height)
+        # CRITICAL FIX: Check if this is a first/last page with full-page background
+        # For first and last pages with full-page background images (is_background=True),
+        # we should ONLY render the background image and text elements.
+        # All other style elements (shapes, borders, decorations) should be filtered out
+        # because they are already included in the background image.
+        layout_regions = layout_data.get('layout', [])
+        has_background_image = False
+        
+        # Check if any image region has is_background=True (full-page background for first/last pages)
+        for region in layout_regions:
+            if region.get('role') == 'image':
+                for elem in region.get('elements', []):
+                    if elem.get('type') == 'image' and elem.get('is_background', False):
+                        has_background_image = True
+                        logger.info(f"Slide {slide_num}: Detected full-page background image "
+                                   f"(first/last page mode) - will filter out shape elements")
+                        break
+                if has_background_image:
+                    break
+        
+        # Process layout regions with filtering if needed
+        for region in layout_regions:
+            self._process_region(region, slide, pdf_width, pdf_height, 
+                                filter_shapes=has_background_image)
 
         # Sort elements by z-index
         slide.sort_elements()
@@ -76,7 +102,7 @@ class CoordinateMapper:
         return slide
     
     def _process_region(self, region: Dict[str, Any], slide: SlideModel, 
-                       pdf_width: float, pdf_height: float):
+                       pdf_width: float, pdf_height: float, filter_shapes: bool = False):
         """
         Process a layout region and add to slide model.
         
@@ -85,34 +111,104 @@ class CoordinateMapper:
             slide: Target slide model
             pdf_width: PDF page width
             pdf_height: PDF page height
+            filter_shapes: If True, skip all shape/decoration elements (for first/last pages)
         """
         role = region.get('role', 'unknown')
         bbox = region.get('bbox', [0, 0, 0, 0])
         elements = region.get('elements', [])
         z_index = region.get('z_index', 0)
         
+        # CRITICAL FIX: For first/last pages with full-page background images,
+        # filter out all shape/decoration elements as they're already in the background
+        if filter_shapes and role in ['shape', 'decoration', 'card_background', 'border', 'background']:
+            logger.debug(f"Slide {slide.slide_number}: Filtering out {role} elements "
+                        f"(already included in full-page background image)")
+            return  # Skip processing this region entirely
+        
         # Convert bbox to normalized coordinates
         position = self._pdf_to_slide_coords(bbox, pdf_width, pdf_height)
         
         if role in ['title', 'subtitle', 'heading', 'text', 'paragraph', 'header', 'footer']:
-            # Process text content
-            # The layout analyzer has already grouped text elements correctly
-            # We just need to convert the region to a textbox
+            # CRITICAL FIX: Create individual textboxes for each text element to prevent overlaps
+            # Issue: Previously, all text elements in a region were merged into one large textbox
+            # with the region's bbox, causing overlaps when Chinese text and numbers are adjacent.
+            # 
+            # Solution: Create separate textboxes for each text element using its own bbox.
+            # This preserves the precise positioning from PDF and prevents artificial overlaps.
             
-            # Use pre-merged text from analyzer if available
-            text = region.get('text', '')
-            if not text:
-                # Fallback: merge element text manually
-                text = self._merge_element_text(elements)
+            # Check if this region contains multiple discrete text elements
+            # If so, create individual textboxes instead of merging
+            text_elements = [e for e in elements if e.get('type') == 'text']
             
-            if text:
-                style = self._extract_text_style(elements)
+            if len(text_elements) > 1:
+                # Multiple text elements - create individual textboxes for each
+                # Group elements by line (same Y position) and process each line
+                # This allows us to fix overlaps within each line
                 
-                # Set as title if it's a title role
-                if role == 'title':
-                    slide.set_title(text)
+                # Group by line
+                lines = {}
+                for elem in text_elements:
+                    y_key = round(elem.get('y', 0))  # Round to nearest pt for grouping
+                    if y_key not in lines:
+                        lines[y_key] = []
+                    lines[y_key].append(elem)
                 
-                slide.add_text(text, position, style, z_index)
+                # Process each line
+                for y_key in sorted(lines.keys()):
+                    line_elements = sorted(lines[y_key], key=lambda e: e.get('x', 0))
+                    
+                    # Track the rightmost x2 to prevent overlaps
+                    prev_x2 = None
+                    
+                    for i, elem in enumerate(line_elements):
+                        text = elem.get('content', '')
+                        if text:
+                            elem_bbox = [elem['x'], elem['y'], elem['x2'], elem['y2']]
+                            
+                            # OVERLAP FIX: Ensure no overlaps with previous element on same line
+                            # PDF may have micro-overlaps (<1pt) or even larger overlaps
+                            if prev_x2 is not None:
+                                gap = elem_bbox[0] - prev_x2
+                                # If overlap detected (gap < 0), shift this element right
+                                if gap < 0:
+                                    shift = abs(gap) + 0.5  # Add 0.5pt buffer
+                                    elem_bbox[0] = prev_x2 + 0.5
+                                    elem_bbox[2] = elem_bbox[0] + (elem['x2'] - elem['x'])  # Keep width
+                                    logger.debug(f"Fixed overlap: '{text[:20]}' shifted right by {shift:.2f}pt")
+                            
+                            # Update prev_x2 for next element
+                            prev_x2 = elem_bbox[2]
+                            
+                            elem_position = self._pdf_to_slide_coords(elem_bbox, pdf_width, pdf_height)
+                            elem_style = {
+                                'font_name': elem.get('font_name', 'Arial'),
+                                'font_size': elem.get('font_size', 18),
+                                'color': elem.get('color', '#000000'),
+                                'bold': elem.get('is_bold', False),
+                                'italic': elem.get('is_italic', False),
+                                'rotation': elem.get('rotation', 0)
+                            }
+                            
+                            # Title role is only for the first element
+                            if role == 'title' and elem == line_elements[0] and y_key == min(lines.keys()):
+                                slide.set_title(text)
+                            
+                            slide.add_text(text, elem_position, elem_style, z_index)
+            else:
+                # Single text element or merged region - use region bbox
+                text = region.get('text', '')
+                if not text:
+                    # Fallback: merge element text manually
+                    text = self._merge_element_text(elements)
+                
+                if text:
+                    style = self._extract_text_style(elements)
+                    
+                    # Set as title if it's a title role
+                    if role == 'title':
+                        slide.set_title(text)
+                    
+                    slide.add_text(text, position, style, z_index)
         
         elif role == 'image':
             # Process image
@@ -168,6 +264,29 @@ class CoordinateMapper:
             for elem in elements:
                 if elem.get('type') == 'shape' and elem.get('fill_color'):
                     slide.set_background(color=elem.get('fill_color'))
+        
+        else:
+            # Handle other element types (like tables)
+            for elem in elements:
+                elem_type = elem.get('type')
+                
+                if elem_type == 'table':
+                    # Process table element
+                    table_position = self._pdf_to_slide_coords(
+                        [elem['x'], elem['y'], elem['x2'], elem['y2']],
+                        pdf_width, pdf_height
+                    )
+                    
+                    # Pass the table grid structure as content
+                    table_content = {
+                        'grid': elem.get('grid', []),
+                        'rows': elem.get('rows', 0),
+                        'cols': elem.get('cols', 0),
+                        'col_widths': elem.get('col_widths', []),  # Include actual column widths from PDF
+                        'row_heights': elem.get('row_heights', [])  # Include actual row heights from PDF
+                    }
+                    
+                    slide.add_table(table_content, table_position, z_index)
     
     def _pdf_to_slide_coords(self, bbox: list, pdf_width: float, 
                             pdf_height: float, apply_border_correction: bool = False,
