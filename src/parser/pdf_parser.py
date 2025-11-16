@@ -254,7 +254,30 @@ class PDFParser:
                            f"({'first' if is_first_page else 'last'} page)")
             else:
                 logger.warning(f"Page {page_num + 1}: Failed to generate background layer")
-        
+
+            # CRITICAL: First/last page special rule - only background + textboxes
+            # Skip all non-text elements (icons, images, shapes, tables, charts)
+            logger.info(f"Page {page_num + 1}: Applying first/last page special rule - background + textboxes only")
+
+            # Extract text blocks (icons will be filtered out)
+            text_elements = self._extract_text_blocks(page)
+
+            # Filter out text elements that are icons
+            icon_indices = self.icon_detector.get_icon_text_indices(text_elements)
+            filtered_text_elements = [
+                elem for i, elem in enumerate(text_elements) if i not in icon_indices
+            ]
+
+            if icon_indices:
+                logger.info(f"Page {page_num + 1}: Filtered out {len(icon_indices)} icon font text element(s)")
+
+            # Add filtered text elements to page data
+            page_data['elements'].extend(filtered_text_elements)
+
+            logger.info(f"Page {page_num + 1}: Extracted {len(filtered_text_elements)} text elements only "
+                       f"(first/last page special rule)")
+            return page_data
+
         # Extract ExtGState opacity mapping for this page
         opacity_map = self._extract_opacity_map(page)
         
