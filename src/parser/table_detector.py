@@ -858,59 +858,83 @@ class TableDetector:
                 # Only consider non-negative gaps
                 if actual_gap >= 0:
                     gap_center = (col_right_edge + next_col_x) / 2
-                    gaps.append((visual_gap, gap_center))
+                    # Store tuple: (visual_gap, actual_gap, gap_center)
+                    gaps.append((visual_gap, actual_gap, gap_center))
                     logger.info(f"Column gap: X={col_x:.1f} (width={col_width:.1f}, right={col_right_edge:.1f}) "
                                f"to next X={next_col_x:.1f}, actual_gap={actual_gap:.1f}pt, "
                                f"visual_gap={visual_gap:.1f}pt")
-            
-            # Sort gaps by size (descending)
-            gaps.sort(reverse=True)
-            
+
+            # Sort gaps by visual size (descending) for detection
+            gaps.sort(reverse=True, key=lambda g: g[0])
+
             # CRITICAL FIX: Handle case where no valid gaps found (all columns overlap or touch)
             if not gaps:
                 logger.debug("Column clustering: No valid gaps found (all columns touch or overlap)")
                 # No gaps means single contiguous table
                 return [cells]
-            
-            largest_gap, largest_gap_pos = gaps[0]
-            
+
+            largest_visual_gap, largest_actual_gap, largest_gap_pos = gaps[0]
+
             # IMPROVED STRATEGY: Calculate typical column spacing (median of smaller gaps)
             # Exclude the largest gap (potential table separator) when calculating typical spacing
-            smaller_gaps = [g[0] for g in gaps[1:]]  # Skip largest gap
+            smaller_gaps = [g[0] for g in gaps[1:]]  # Skip largest gap (use visual gap)
             if smaller_gaps:
                 smaller_gaps.sort()
                 median_gap = smaller_gaps[len(smaller_gaps) // 2]
             else:
                 median_gap = 0
-            
-            # STRICT CRITERIA for table separation (using visual gaps):
-            # Strategy 1: Absolute threshold - gap >= 80pt (visual gap, including wide column bonus)
-            # Strategy 2: Relative threshold - gap >= 2x median gap
-            # 
-            # Examples with NEW visual gap calculation:
-            # - Page 12: Col 0 (40.8pt) gap to Col 1 = 0pt, no bonus -> visual_gap=0pt (no split) ✓
-            # - Page 10: Col 2 (230.4pt) gap to Col 3 = 7.9pt + 80.4pt bonus -> visual_gap=88.3pt (split) ✓
-            # - Page 7: Normal column gaps, no wide columns -> use relative ratio check
+
+            # ENHANCED CRITERIA for table separation (using visual gaps):
+            # Strategy 1: Absolute threshold - gap >= 50pt (for large gaps)
+            # Strategy 2: Relative threshold - gap >= 3.5x median (for significant separations)
+            # Strategy 3: Medium gap - 15pt <= actual_gap < 50pt with median=0 (single gap case)
             #
-            # IMPORTANT: Lowered absolute threshold from 200pt to 80pt to catch side-by-side tables
-            # where visual separation comes from wide column bonus rather than actual spacing
-            min_gap_threshold = 80  # pt - visual gap threshold
-            min_ratio = 2.5  # Relative threshold (slightly higher since we lowered absolute threshold)
-            
-            if (largest_gap >= min_gap_threshold and 
-                (median_gap == 0 or largest_gap >= median_gap * min_ratio)):
+            # Examples with visual gap calculation:
+            # - Page 12: Col gap = 0pt, no bonus -> visual_gap=0pt (no split) ✓
+            # - Page 10: Col gap = 7.9pt + 80.4pt bonus -> visual_gap=88.3pt (split) ✓
+            # - Page 24: visual_gap = 40.8pt < 50pt, actual_gap=0pt (no split) ✓
+            # - Page 41 (Fixed): actual_gap = 15.1pt, median=0pt -> split via medium gap rule ✓
+            #
+            # OPTIMIZATION: Balanced threshold at 50pt to avoid false splits while
+            # using medium gap rule (15-50pt actual gap with median=0) to catch true separators
+            min_gap_threshold = 50  # pt - visual gap threshold (balanced for reliability)
+            min_ratio = 3.5  # Relative threshold (raised to avoid false positives)
+            significant_ratio = 3.5  # Significant gap ratio threshold
+
+            ratio_str = f"{largest_visual_gap/median_gap:.1f}" if median_gap > 0 else 'inf'
+
+            # Check if gap meets split criteria:
+            # 1. Absolute: visual_gap >= 50pt (for large visual separations)
+            # 2. Significant relative: visual_gap >= 3.5x median (for obvious separations)
+            # 3. Medium gap: 15pt <= actual_gap < 50pt with median=0 (single real gap case)
+            should_split = False
+            split_reason = ""
+
+            if largest_visual_gap >= min_gap_threshold and (median_gap == 0 or largest_visual_gap >= median_gap * min_ratio):
+                should_split = True
+                split_reason = f"absolute threshold (visual_gap={largest_visual_gap:.1f}pt >= {min_gap_threshold}pt, median={median_gap:.1f}pt)"
+            elif median_gap > 0 and largest_visual_gap >= median_gap * significant_ratio:
+                should_split = True
+                split_reason = f"significant gap ratio (visual_gap={largest_visual_gap:.1f}pt, ratio={ratio_str}x >= {significant_ratio}x)"
+            elif median_gap == 0 and 15 <= largest_actual_gap < min_gap_threshold:
+                # Special case for medium gaps (15-50pt actual gap) with zero median
+                # Use ACTUAL gap (not visual) to avoid wide column bonus interference
+                # This handles cases like Page 41 (actual 15.1pt gap) while avoiding Page 24 (actual 0pt gap with 40.8pt bonus)
+                should_split = True
+                split_reason = f"medium actual gap with zero median (actual_gap={largest_actual_gap:.1f}pt in [15, {min_gap_threshold}), median=0pt)"
+
+            if should_split:
                 consistent_gaps.append(largest_gap_pos)
-                ratio_str = f"{largest_gap/median_gap:.1f}" if median_gap > 0 else 'inf'
                 logger.info(f"Detected horizontal split via column clustering: "
-                           f"largest gap {largest_gap:.1f}pt (median gap: {median_gap:.1f}pt, "
-                           f"ratio: {ratio_str}x) "
+                           f"visual_gap={largest_visual_gap:.1f}pt, actual_gap={largest_actual_gap:.1f}pt "
+                           f"(median: {median_gap:.1f}pt, ratio: {ratio_str}x) "
                            f"at X≈{largest_gap_pos:.1f} "
-                           f"(column positions: {[f'{x:.0f}' for x in sorted_col_x]})")
+                           f"(column positions: {[f'{x:.0f}' for x in sorted_col_x]}) "
+                           f"[reason: {split_reason}]")
             else:
-                ratio_str = f"{largest_gap/median_gap:.1f}" if median_gap > 0 else 'inf'
-                logger.debug(f"Column clustering: No clear split (largest gap={largest_gap:.1f}pt, "
-                            f"median gap={median_gap:.1f}pt, "
-                            f"ratio={ratio_str}x < {min_ratio}x or gap < 200pt)")
+                logger.debug(f"Column clustering: No clear split (visual_gap={largest_visual_gap:.1f}pt, "
+                            f"actual_gap={largest_actual_gap:.1f}pt, median={median_gap:.1f}pt, "
+                            f"ratio={ratio_str}x < {min_ratio}x or gap < {min_gap_threshold}pt)")
         
         # Step 4: Split cells into groups based on consistent gaps
         if not consistent_gaps:
