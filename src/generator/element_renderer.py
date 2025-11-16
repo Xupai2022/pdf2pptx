@@ -9,6 +9,7 @@ from pptx.util import Inches, Pt
 from pptx.enum.shapes import MSO_SHAPE
 from ..rebuilder.slide_model import SlideElement
 from ..mapper.style_mapper import StyleMapper
+from ..utils.xml_utils import set_run_font_xml, is_cjk_font
 
 logger = logging.getLogger(__name__)
 
@@ -740,18 +741,24 @@ class ElementRenderer:
                                 # Apply font size
                                 if font_size:
                                     run.font.size = PtUtil(font_size)
-                                
+
                                 # Apply font color
                                 if font_color and font_color.startswith('#') and len(font_color) == 7:
                                     rgb = tuple(int(font_color[i:i+2], 16) for i in (1, 3, 5))
                                     run.font.color.rgb = RGBColorUtil(*rgb)
-                                
+
                                 # Apply font family
                                 if font_family:
                                     run.font.name = font_family
-                                
+
                                 # Apply bold property
                                 run.font.bold = is_bold_in_pdf
+
+                                # Set XML-level font properties for WPS compatibility
+                                # This sets latin, ea (East Asian), and cs (Complex Script) font attributes
+                                if font_family:
+                                    is_cjk = is_cjk_font(font_family)
+                                    set_run_font_xml(run, font_family, is_cjk=is_cjk)
                         
                         logger.debug(f"Applied formatting to {len(cell.text_frame.paragraphs)} paragraph(s) "
                                    f"in cell '{cell.text[:20]}': {font_family}, {font_size}pt, bold={is_bold_in_pdf}, "

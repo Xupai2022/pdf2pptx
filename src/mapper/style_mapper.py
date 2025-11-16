@@ -8,6 +8,7 @@ from pptx.util import Pt, Inches
 from pptx.dml.color import RGBColor
 from lxml import etree
 from .font_mapper import FontMapper
+from ..utils.xml_utils import set_run_font_xml, is_cjk_font
 
 logger = logging.getLogger(__name__)
 
@@ -62,43 +63,57 @@ class StyleMapper:
     def apply_text_style(self, text_frame, style: Dict[str, Any]):
         """
         Apply text style to a PowerPoint text frame.
-        
+
         Args:
             text_frame: PowerPoint text frame object
             style: Style dictionary
         """
         if not text_frame or not text_frame.paragraphs:
+            logger.debug("apply_text_style: No text frame or paragraphs")
             return
-        
+
         paragraph = text_frame.paragraphs[0]
-        
+
         # Font name
         font_name = style.get('font_name', '')
+        logger.info(f"apply_text_style: Original font='{font_name}'")
         mapped_font = self.font_mapper.map_font(font_name)
-        
+        logger.info(f"apply_text_style: Mapped font='{mapped_font}'")
+
         # Font size with scaling (PDF points to screen pixels)
         font_size_raw = style.get('font_size', self.default_font_size)
         font_size = font_size_raw * self.font_size_scale
-        
+
         # Color
         color = style.get('color', '#000000')
         rgb = self.hex_to_rgb(color)
-        
+
         # Bold and italic - support both 'bold'/'italic' and 'is_bold'/'is_italic' keys
         is_bold = style.get('is_bold', style.get('bold', False))
         is_italic = style.get('is_italic', style.get('italic', False))
-        
+
+        logger.info(f"apply_text_style: Processing {len(paragraph.runs)} run(s), font='{mapped_font}', size={font_size:.1f}pt")
+
         # Apply to all runs in paragraph
-        for run in paragraph.runs:
+        for i, run in enumerate(paragraph.runs):
+            logger.debug(f"apply_text_style: Run {i}: text='{run.text[:30]}'")
             run.font.name = mapped_font
             run.font.size = Pt(font_size)
-            
+
+            # Set XML-level font properties for WPS compatibility
+            # This sets latin, ea (East Asian), and cs (Complex Script) font attributes
+            is_cjk = is_cjk_font(mapped_font)
+            logger.info(f"apply_text_style: Run {i}: is_cjk_font('{mapped_font}') = {is_cjk}")
+            set_run_font_xml(run, mapped_font, is_cjk=is_cjk)
+
             # Only apply color if valid RGB was extracted
             if self.preserve_colors and rgb is not None:
                 run.font.color.rgb = RGBColor(*rgb)
-            
+
             run.font.bold = is_bold
             run.font.italic = is_italic
+
+        logger.info(f"apply_text_style: COMPLETE - Applied font '{mapped_font}' to all runs")
     
     def apply_shape_style(self, shape, style: Dict[str, Any]):
         """
