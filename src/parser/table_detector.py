@@ -366,22 +366,41 @@ class TableDetector:
                 
                 # Calculate gaps between consecutive columns
                 if len(col_x_positions) >= 2:
-                    gaps = [col_x_positions[i+1] - col_x_positions[i] 
+                    gaps = [col_x_positions[i+1] - col_x_positions[i]
                            for i in range(len(col_x_positions) - 1)]
-                    
-                    # If there's a gap > 20pt between columns, it's likely two separate regions
-                    # CRITICAL: This threshold should be smaller than typical column spacing
-                    # but larger than typical cell borders (which are < 5pt)
+
                     max_gap = max(gaps) if gaps else 0
                     median_gap = sorted(gaps)[len(gaps)//2] if gaps else 0
-                    
-                    # Reject if max gap is > 3x median gap AND > 20pt (indicates discontinuity)
-                    if max_gap > 20 and (median_gap == 0 or max_gap > median_gap * 3):
+                    table_width = col_x_positions[-1] - col_x_positions[0]
+
+                    # Changed: Use relative threshold based on table width instead of fixed ratio
+                    # This allows wide columns (e.g., description columns in reports) while still
+                    # detecting disconnected regions (e.g., chart + table)
+                    # Reject if:
+                    # 1. Absolute threshold: gap > 600pt (extremely wide, likely disconnected)
+                    # 2. Relative threshold: gap > 80% of table width (indicates separation)
+                    # 3. Ratio threshold: gap > 4.5x median (was 3x, balanced for wide columns)
+                    # 4. Column count check: > 8 columns AND median_ratio > 1.5 (likely over-merged)
+                    gap_ratio = max_gap / table_width if table_width > 0 else 0
+                    median_ratio = max_gap / median_gap if median_gap > 0 else 0
+                    num_cols = len(col_x_positions) - 1  # Actual columns = positions - 1
+
+                    # Additional check: reject tables with excessive columns (likely over-merged)
+                    # Tables with > 8 columns AND any significant gap are suspicious
+                    over_merged = num_cols > 8 and median_ratio > 1.5
+
+                    if max_gap > 600 or gap_ratio > 0.8 or (max_gap > 20 and median_ratio > 4.5) or over_merged:
                         logger.info(f"Rejected line-based table: columns have large gap "
-                                   f"(max_gap={max_gap:.1f}pt, median={median_gap:.1f}pt), "
-                                   f"likely spans disconnected regions")
+                                   f"(max_gap={max_gap:.1f}pt, median={median_gap:.1f}pt, "
+                                   f"gap_ratio={gap_ratio:.1%}, median_ratio={median_ratio:.1f}x, cols={num_cols}), "
+                                   f"{'over-merged (cols > 8)' if over_merged else 'likely spans disconnected regions'}")
                         return []
-            
+                    else:
+                        # Log gap data for accepted tables to help diagnose issues
+                        logger.debug(f"Accepted line-based table gap check: max_gap={max_gap:.1f}pt, "
+                                    f"median={median_gap:.1f}pt, gap_ratio={gap_ratio:.1%}, "
+                                    f"median_ratio={median_ratio:.1f}x, cols={num_cols}")
+
             logger.info(f"Detected line-based table: {table['rows']}x{table['cols']} grid")
             return [table]
         
@@ -512,17 +531,23 @@ class TableDetector:
         col_positions = sorted(v_line_groups.keys())
         
         # CRITICAL CHECK: Detect horizontal gaps in column positions
-        # If there's a large gap (> 50pt) between columns, it indicates
-        # two separate regions that should NOT be merged into one table
+        # Changed from fixed 50pt threshold to relative threshold based on table width
+        # This allows wide columns (e.g., description columns in reports) while still
+        # detecting disconnected regions (e.g., chart + table merged incorrectly)
         if len(col_positions) >= 2:
-            gaps = [col_positions[i+1] - col_positions[i] 
+            gaps = [col_positions[i+1] - col_positions[i]
                    for i in range(len(col_positions) - 1)]
             max_gap = max(gaps) if gaps else 0
-            
-            # If max gap > 50pt, reject this table (likely spans disconnected regions)
-            if max_gap > 50:
+            table_width = col_positions[-1] - col_positions[0]
+
+            # Reject only if gap is both large AND disproportionate
+            # - Absolute threshold: > 600pt (unusually wide single column)
+            # - Relative threshold: > 80% of table width (indicates separation, not wide column)
+            gap_ratio = max_gap / table_width if table_width > 0 else 0
+            if max_gap > 600 or gap_ratio > 0.8:
                 logger.info(f"Rejected line-based table: columns have large gap "
-                           f"(max_gap={max_gap:.1f}pt), likely spans disconnected regions "
+                           f"(max_gap={max_gap:.1f}pt, gap_ratio={gap_ratio:.1%}, "
+                           f"table_width={table_width:.1f}pt), likely spans disconnected regions "
                            f"(e.g., chart + table)")
                 return None
         
