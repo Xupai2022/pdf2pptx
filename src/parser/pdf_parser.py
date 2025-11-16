@@ -99,88 +99,67 @@ class PDFParser:
     def _generate_page_background_without_text(self, page: fitz.Page, page_num: int) -> Optional[Dict[str, Any]]:
         """
         Generate a full-page background image without text for the given page.
-        This creates a complete page render excluding text elements.
-        
-        CRITICAL FIX: Render full page then remove text pixels using transparency.
-        Instead of masking text with opaque rectangles (which leave visible artifacts),
-        we render the complete page first, then make text pixels transparent.
-        This preserves ALL original PDF backgrounds, patterns, and styles perfectly.
-        
+        This creates a complete background render that preserves ALL visual elements
+        except text, ensuring background patterns and styles remain intact.
+
+        CRITICAL PRINCIPLE:
+        Background images should contain the complete visual design (colors, patterns,
+        shapes, images) but NO text, allowing textboxes to be placed on top.
+        When users move textboxes, the complete background remains visible.
+
+        CRITICAL FIX: Use REDACTION to remove text BEFORE rendering.
+        Instead of rendering-with-text-then-making-transparent (which loses background
+        styles that intersect with text regions), we apply redactions to remove text
+        BEFORE rendering. This preserves 100% of background patterns and styles.
+
         Strategy:
-        1. Render the full page at high resolution (includes everything)
-        2. Extract text bounding boxes to identify text regions
-        3. Make text pixels transparent by setting alpha channel to 0
-        4. Result: Complete original background with transparent "holes" where text was
-        
-        This approach avoids any visible artifacts because transparency is truly invisible,
-        while preserving all original PDF visual elements (backgrounds, patterns, shapes).
-        
+        1. Add redaction annotation covering the entire page
+        2. Apply redactions with TEXT_REMOVE but keep IMAGES and GRAPHICS
+        3. Render the page at high resolution (now without text)
+        4. Convert to PNG and save as background layer
+
+        This approach ensures 100% background fidelity - nothing is masked or removed.
+
         Args:
             page: PyMuPDF page object
             page_num: Page number for identification
-            
+
         Returns:
             Image element dictionary with z_index=-1000, or None if generation fails
         """
         try:
             rect = page.rect
-            
-            # Step 1: Extract text bounding boxes
-            text_bboxes = []
-            text_dict = page.get_text("dict")
-            for block in text_dict.get("blocks", []):
-                if block.get("type") == 0:  # Text block
-                    for line in block.get("lines", []):
-                        for span in line.get("spans", []):
-                            bbox = span.get("bbox", [0, 0, 0, 0])
-                            # Only include reasonable-sized text (filter noise)
-                            if bbox[2] - bbox[0] > 2 and bbox[3] - bbox[1] > 2:
-                                text_bboxes.append(bbox)
-            
-            logger.info(f"Page {page_num}: Found {len(text_bboxes)} text regions to make transparent")
-            
-            # Step 2: Render the full page at high resolution
+
+            # Step 1: Add redaction annotation to remove text
+            # CRITICAL: This removes text content before rendering,
+            # preserving background patterns that intersect text areas
+            page.add_redact_annot(rect)
+
+            # Step 2: Apply redactions - remove text but keep images and graphics
+            # PDF_REDACT_IMAGE_NONE: Keep all images
+            # PDF_REDACT_LINE_ART_NONE: Keep all vector graphics (shapes, lines, etc.)
+            # Default behavior removes text only
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,      # Preserve images
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE  # Preserve vector graphics
+            )
+
+            # Step 3: Render the page WITHOUT text (but with complete background)
             zoom = 2.0  # 2x for ~144 DPI from 72 DPI
             matrix = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=matrix, alpha=True)
-            
-            # Step 3: Convert to PIL Image and make text regions transparent
-            from PIL import Image, ImageDraw
-            
+
+            # Step 4: Convert to PIL Image (no masking needed!)
+            from PIL import Image
+
             # Convert pixmap to PIL Image
             img = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
-            
-            # Create an alpha mask for text regions
-            # We'll set alpha to 0 (fully transparent) for text pixels
-            alpha_mask = img.getchannel('A')  # Get current alpha channel
-            draw = ImageDraw.Draw(alpha_mask)
-            
-            # Make each text region fully transparent
-            for bbox in text_bboxes:
-                # Scale bbox coordinates by zoom factor
-                x0, y0, x2, y2 = bbox
-                x0_scaled = int(x0 * zoom)
-                y0_scaled = int(y0 * zoom)
-                x2_scaled = int(x2 * zoom)
-                y2_scaled = int(y2 * zoom)
-                
-                # Draw a black rectangle in alpha channel (0 = transparent)
-                # Add a small padding (2px) to ensure complete coverage
-                padding = 2
-                draw.rectangle(
-                    [x0_scaled - padding, y0_scaled - padding, 
-                     x2_scaled + padding, y2_scaled + padding],
-                    fill=0  # 0 = fully transparent
-                )
-            
-            # Apply the modified alpha mask back to the image
-            img.putalpha(alpha_mask)
-            
-            # Step 4: Convert back to PNG bytes
+
+            # Step 5: Convert back to PNG bytes
             img_bytes = io.BytesIO()
             img.save(img_bytes, format='PNG')
             image_bytes = img_bytes.getvalue()
-            
+
             # Create image element with lowest z-index to ensure it's at the bottom
             background_element = {
                 'type': 'image',
@@ -198,13 +177,13 @@ class PDFParser:
                 'is_background': True,
                 'z_index': -1000  # Ensure this is rendered at the bottom
             }
-            
+
             logger.info(f"Generated text-free full-page background for page {page_num} "
                        f"(size: {pix.width}x{pix.height}px, {len(image_bytes)} bytes) "
-                       f"by making {len(text_bboxes)} text regions transparent")
-            
+                       f"using redaction (preserved all background styles)")
+
             return background_element
-            
+
         except Exception as e:
             logger.error(f"Failed to generate page background for page {page_num}: {e}")
             import traceback
@@ -243,23 +222,13 @@ class PDFParser:
         total_pages = len(self.doc)
         is_first_page = (page_num == 0)
         is_last_page = (page_num == total_pages - 1)
-        
-        # For first and last pages, generate full-page background image
-        if is_first_page or is_last_page:
-            background_elem = self._generate_page_background_without_text(page, page_num)
-            if background_elem:
-                # Add background element with lowest z-index
-                page_data['elements'].append(background_elem)
-                logger.info(f"Page {page_num + 1}: Added full-page background layer "
-                           f"({'first' if is_first_page else 'last'} page)")
-            else:
-                logger.warning(f"Page {page_num + 1}: Failed to generate background layer")
 
-            # CRITICAL: First/last page special rule - only background + textboxes
-            # Skip all non-text elements (icons, images, shapes, tables, charts)
+        # CRITICAL: First/last page special rule - only background + textboxes
+        if is_first_page or is_last_page:
             logger.info(f"Page {page_num + 1}: Applying first/last page special rule - background + textboxes only")
 
-            # Extract text blocks (icons will be filtered out)
+            # Step 1: Extract text blocks FIRST (before generating background)
+            # This ensures we capture text before redaction removes it
             text_elements = self._extract_text_blocks(page)
 
             # Filter out text elements that are icons
@@ -271,7 +240,17 @@ class PDFParser:
             if icon_indices:
                 logger.info(f"Page {page_num + 1}: Filtered out {len(icon_indices)} icon font text element(s)")
 
-            # Add filtered text elements to page data
+            # Step 2: Generate background image (using redaction, modifies page)
+            background_elem = self._generate_page_background_without_text(page, page_num)
+            if background_elem:
+                # Add background element with lowest z-index
+                page_data['elements'].append(background_elem)
+                logger.info(f"Page {page_num + 1}: Added full-page background layer "
+                           f"({'first' if is_first_page else 'last'} page)")
+            else:
+                logger.warning(f"Page {page_num + 1}: Failed to generate background layer")
+
+            # Step 3: Add filtered text elements to page data
             page_data['elements'].extend(filtered_text_elements)
 
             logger.info(f"Page {page_num + 1}: Extracted {len(filtered_text_elements)} text elements only "
