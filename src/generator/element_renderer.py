@@ -400,7 +400,11 @@ class ElementRenderer:
                 # For lines and triangles, we need to use connectors or stroke-only rectangles
                 # Check if this has stroke but no fill
                 has_stroke = style.get('stroke_color') is not None
-                has_fill = style.get('fill_color') is not None
+                # CRITICAL FIX: Check fill_opacity to detect truly transparent fills
+                # Even if fill_color is set, if fill_opacity is 0.0, treat as no fill
+                fill_color = style.get('fill_color')
+                fill_opacity = style.get('fill_opacity', 1.0)
+                has_fill = fill_color is not None and fill_color != 'None' and fill_opacity > 0.0
                 
                 if shape_type.lower() == 'line' and has_stroke and not has_fill:
                     # This is a true line - render as a connector
@@ -483,7 +487,8 @@ class ElementRenderer:
                         # Set line width
                         stroke_width = style.get('stroke_width', 1)
                         line.width = Pt(stroke_width)
-                    
+                        logger.debug(f"Set line width: {stroke_width}pt")
+
                     logger.debug(f"Rendered line from ({begin_x}, {begin_y}) to ({end_x}, {end_y})")
                     return connector
             

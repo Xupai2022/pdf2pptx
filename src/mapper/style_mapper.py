@@ -155,11 +155,15 @@ class StyleMapper:
             # fill_color can be:
             #   - None: stroke-only shape (no fill) -> set transparent fill
             #   - "None": invalid value -> set transparent fill
+            #   - hex color string with opacity 0.0: transparent fill -> set transparent fill
             #   - hex color string: normal fill color
-            if fill_color is None or fill_color == 'None':
+            # CRITICAL FIX: Check fill_opacity to detect truly transparent fills
+            # Even if fill_color is set (e.g., black #000000), if fill_opacity is 0.0,
+            # it should be treated as "no fill" (stroke-only shape)
+            if fill_color is None or fill_color == 'None' or fill_opacity == 0.0:
                 # Stroke-only shape or invalid fill - make fill transparent
                 shape.fill.background()
-                logger.debug(f"No fill color (stroke-only shape): fill_color={fill_color}")
+                logger.debug(f"No fill color (stroke-only shape): fill_color={fill_color}, opacity={fill_opacity}")
             elif self.preserve_colors:
                 # Normal fill color - convert and apply
                 rgb = self.hex_to_rgb(fill_color)
@@ -219,10 +223,11 @@ class StyleMapper:
                 # For filled shapes (rectangles with fill_color), we should NOT touch the line at all
                 # to preserve the default PowerPoint behavior (no border)
                 # This fixes the issue where gray vertical lines (#383F4E fill) lost their color
-                if fill_color is None or fill_color == 'None':
+                # Also check fill_opacity: if it's 0.0, treat as stroke-only shape
+                if fill_color is None or fill_color == 'None' or fill_opacity == 0.0:
                     # Only for truly stroke-only shapes, make line transparent
                     shape.line.fill.background()
-                    logger.debug(f"No border for stroke-only shape: stroke_color={stroke_color}")
+                    logger.debug(f"No border for stroke-only shape: stroke_color={stroke_color}, fill_opacity={fill_opacity}")
                 else:
                     # For filled shapes, explicitly set no line to avoid default black border
                     shape.line.color.rgb = RGBColor(0, 0, 0)  # Workaround: set to black first

@@ -1729,7 +1729,10 @@ class PDFParser:
         # Characteristics: 1 line item OR very thin shape with stroke but no fill
         fill = drawing.get('fill', None)
         stroke = drawing.get('color', None)
-        has_fill = fill is not None
+        fill_opacity = drawing.get('fill_opacity', 1.0)
+        # CRITICAL FIX: Check fill_opacity to detect truly transparent fills
+        # Even if fill color exists (e.g., black), if fill_opacity is 0.0, treat as no fill
+        has_fill = fill is not None and fill_opacity > 0.0
         has_stroke = stroke is not None
         
         if line_count == 1 and curve_count == 0:
