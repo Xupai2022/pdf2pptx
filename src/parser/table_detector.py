@@ -208,16 +208,18 @@ class TableDetector:
                 continue
             
             # LENIENT filtering for normal-height shapes (height >= 20pt)
-            # Only filter extremely wide bars (> 25:1) to catch title/section bars
-            if height >= 20 and aspect_ratio > 25:
-                logger.debug(f"Filtered wide decorative bar: {width:.1f}x{height:.1f}pt (aspect ratio {aspect_ratio:.1f}:1 > 25:1)")
-                continue
-            
+            # CRITICAL FIX: Don't immediately filter wide bars (aspect_ratio > 25)
+            # because they might be merged table headers (e.g., Page 30: 864.7x28.8pt, ratio=30:1)
+            # Instead, mark them as suspicious and validate in second pass based on X-alignment
+
             # Has stroke or fill (visible cell)
             has_stroke = shape.get('stroke_color') is not None
             has_fill = shape.get('fill_color') is not None
-            
+
             if has_stroke or has_fill:
+                # Mark wide bars for second-pass validation
+                if height >= 20 and aspect_ratio > 25:
+                    shape['_suspicious_wide_bar'] = True
                 candidates.append(shape)
         
         if not candidates:
@@ -283,8 +285,48 @@ class TableDetector:
         
         logger.info(f"Filtered {len(candidates)} -> {len(filtered_candidates)} cell candidates "
                    f"(removed {len(candidates) - len(filtered_candidates)} backgrounds)")
-        
-        return filtered_candidates
+
+        # CRITICAL FIX: Third pass - validate suspicious wide bars
+        # Check if they align with normal cells (merged table headers) or are isolated (decorative bars)
+        suspicious_bars = [c for c in filtered_candidates if c.get('_suspicious_wide_bar')]
+        normal_cells = [c for c in filtered_candidates if not c.get('_suspicious_wide_bar')]
+
+        if suspicious_bars and normal_cells:
+            # Collect X positions of normal cells (with tolerance)
+            tolerance = 5.0  # 5pt tolerance for X-alignment
+            normal_x_positions = set()
+            for cell in normal_cells:
+                x = cell['x']
+                # Round to tolerance
+                x_rounded = round(x / tolerance) * tolerance
+                normal_x_positions.add(x_rounded)
+
+            # Validate each suspicious bar
+            final_candidates = list(normal_cells)  # Start with all normal cells
+            for bar in suspicious_bars:
+                bar_x = round(bar['x'] / tolerance) * tolerance
+
+                # Check if bar's X position aligns with any normal cell's X position
+                if bar_x in normal_x_positions:
+                    # Aligned - likely merged table header, keep it
+                    logger.info(f"Kept wide bar {bar['width']:.1f}x{bar['height']:.1f}pt at X={bar['x']:.1f} "
+                               f"(aligned with normal cells, likely merged header)")
+                    # Remove the marker
+                    if '_suspicious_wide_bar' in bar:
+                        del bar['_suspicious_wide_bar']
+                    final_candidates.append(bar)
+                else:
+                    # Not aligned - decorative bar, filter it out
+                    logger.debug(f"Filtered decorative bar {bar['width']:.1f}x{bar['height']:.1f}pt at X={bar['x']:.1f} "
+                                f"(not aligned with table cells)")
+
+            return final_candidates
+        else:
+            # No suspicious bars or no normal cells - return as is
+            for c in filtered_candidates:
+                if '_suspicious_wide_bar' in c:
+                    del c['_suspicious_wide_bar']
+            return filtered_candidates
     
     def _detect_line_based_tables(self, shapes: List[Dict[str, Any]], 
                                   page: fitz.Page) -> List[Dict[str, Any]]:
@@ -911,15 +953,28 @@ class TableDetector:
             split_reason = ""
 
             if largest_visual_gap >= min_gap_threshold and (median_gap == 0 or largest_visual_gap >= median_gap * min_ratio):
-                should_split = True
-                split_reason = f"absolute threshold (visual_gap={largest_visual_gap:.1f}pt >= {min_gap_threshold}pt, median={median_gap:.1f}pt)"
+                # CRITICAL FIX: When relying on wide_column_bonus, require actual_gap > 5pt
+                # to avoid splitting single tables with wide columns that touch each other.
+                # Example: Page 30 has wide column (259.2pt) touching next column (actual_gap=0pt)
+                # which gets 109.2pt bonus -> visual_gap=109.2pt, triggering false split.
+                # Real side-by-side tables (Page 28) have actual_gap > 5pt even before bonus.
+                wide_col_bonus_used = largest_visual_gap - largest_actual_gap > 50  # bonus contributed >50pt
+                if wide_col_bonus_used and largest_actual_gap <= 5:
+                    # Wide column bonus was used but actual gap is tiny/zero -> likely same table
+                    logger.debug(f"Absolute threshold: visual_gap={largest_visual_gap:.1f}pt >= {min_gap_threshold}pt "
+                                f"BUT actual_gap={largest_actual_gap:.1f}pt <= 5pt with wide_col_bonus "
+                                f"-> likely single table with wide columns, NO SPLIT")
+                else:
+                    should_split = True
+                    split_reason = f"absolute threshold (visual_gap={largest_visual_gap:.1f}pt >= {min_gap_threshold}pt, actual_gap={largest_actual_gap:.1f}pt, median={median_gap:.1f}pt)"
             elif median_gap > 0 and largest_visual_gap >= median_gap * significant_ratio:
                 should_split = True
                 split_reason = f"significant gap ratio (visual_gap={largest_visual_gap:.1f}pt, ratio={ratio_str}x >= {significant_ratio}x)"
             elif median_gap == 0 and 15 <= largest_actual_gap < min_gap_threshold:
                 # Special case for medium gaps (15-50pt actual gap) with zero median
                 # Use ACTUAL gap (not visual) to avoid wide column bonus interference
-                # This handles cases like Page 41 (actual 15.1pt gap) while avoiding Page 24 (actual 0pt gap with 40.8pt bonus)
+                # This handles cases like Page 41 (actual 15.1pt gap) while avoiding Page 30 (0pt gap)
+                # The 15pt threshold catches legitimate side-by-side tables with modest gaps
                 should_split = True
                 split_reason = f"medium actual gap with zero median (actual_gap={largest_actual_gap:.1f}pt in [15, {min_gap_threshold}), median=0pt)"
 
@@ -1233,13 +1288,26 @@ class TableDetector:
         # CRITICAL FIX: Collect consecutive rows both forwards AND backwards
         # This handles sparse columns where header/footer have more columns than data rows
         table_rows = [first_row]
-        
+
         # Collect rows forwards (after start_idx)
         for i in range(start_idx + 1, len(rows)):
             row = rows[i]
-            row_col_positions = sorted([round(cell['x'] / self.alignment_tolerance) * 
+            row_col_positions = sorted([round(cell['x'] / self.alignment_tolerance) *
                                        self.alignment_tolerance for cell in row])
-            
+
+            # CRITICAL FIX: Check row spacing to avoid including isolated elements
+            # If this row is too far from the last collected row (>50pt gap), stop collecting
+            # This filters out unrelated elements like page decorations or text boxes above/below table
+            # Example: Page 30 has cells at Y=74.2, 84.2 (decorations) far from table at Y=188.6
+            if table_rows:
+                last_row_y = max(cell['y2'] for cell in table_rows[-1])
+                current_row_y = min(cell['y'] for cell in row)
+                row_gap = current_row_y - last_row_y
+
+                if row_gap > 50:  # 50pt threshold for row separation
+                    logger.debug(f"Forward row {i}: row_gap={row_gap:.1f}pt > 50pt, stopping (isolated element)")
+                    break
+
             # Check if columns roughly match
             match_result = self._columns_match(first_row_col_positions, row_col_positions)
             logger.debug(f"Forward row {i}: cols={row_col_positions} vs reference={first_row_col_positions}, match={match_result}")
@@ -1252,9 +1320,20 @@ class TableDetector:
         # This handles cases where we start from a footer row with all columns
         for i in range(start_idx - 1, -1, -1):
             row = rows[i]
-            row_col_positions = sorted([round(cell['x'] / self.alignment_tolerance) * 
+            row_col_positions = sorted([round(cell['x'] / self.alignment_tolerance) *
                                        self.alignment_tolerance for cell in row])
-            
+
+            # CRITICAL FIX: Check row spacing in backward direction too
+            # If this row is too far from the first collected row (>50pt gap), stop collecting
+            if table_rows:
+                first_collected_y = min(cell['y'] for cell in table_rows[0])
+                current_row_y2 = max(cell['y2'] for cell in row)
+                row_gap = first_collected_y - current_row_y2
+
+                if row_gap > 50:  # 50pt threshold for row separation
+                    logger.debug(f"Backward row {i}: row_gap={row_gap:.1f}pt > 50pt, stopping (isolated element)")
+                    break
+
             # Check if columns roughly match
             match_result = self._columns_match(first_row_col_positions, row_col_positions)
             logger.debug(f"Backward row {i}: cols={row_col_positions} vs reference={first_row_col_positions}, match={match_result}")
