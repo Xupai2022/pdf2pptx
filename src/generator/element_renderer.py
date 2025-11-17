@@ -774,7 +774,7 @@ class ElementRenderer:
                     # For page 8 table:
                     # - Header row: FangSong, 7.5pt, RGB(112,122,137)
                     # - Data rows: FangSong, 7.5pt, RGB(20,22,26)
-                    # 
+                    #
                     # CRITICAL FIX: For multi-line cells, apply formatting to ALL paragraphs and runs
                     # Issue: Page 9 and 12 tables have cells with multiple lines (e.g., "托管资产相关检查\n（托管资产...）")
                     # When cell.text contains '\n', PowerPoint creates multiple paragraphs
@@ -783,14 +783,21 @@ class ElementRenderer:
                     if text_elements and cell.text_frame.paragraphs:
                         from pptx.util import Pt as PtUtil
                         from pptx.dml.color import RGBColor as RGBColorUtil
-                        
+
                         # Get first text element's style as representative for all text in cell
                         # (All text in a cell typically has the same font properties)
                         first_text = text_elements[0]
                         font_size = first_text.get('font_size')
                         font_color = first_text.get('color')
-                        font_family = first_text.get('font_name')
+                        font_family_raw = first_text.get('font_name')
                         is_bold_in_pdf = first_text.get('is_bold', False)
+
+                        # CRITICAL: Map font through FontMapper (fix for WPS font display issue)
+                        # Issue: Table cell fonts were not being mapped (e.g., FangSong → 仿宋)
+                        # This caused WPS to not recognize CJK fonts and fall back to 宋体（正文）
+                        # Solution: Use font_mapper.map_font() like apply_text_style() does
+                        font_family = self.style_mapper.font_mapper.map_font(font_family_raw) if font_family_raw else None
+                        logger.debug(f"Table cell font mapping: '{font_family_raw}' → '{font_family}'")
                         
                         # CRITICAL ENHANCEMENT: Apply text alignment detected from PDF
                         # Read alignment from cell_data (detected by table_detector._populate_table_cells)
@@ -838,8 +845,8 @@ class ElementRenderer:
                                     set_run_font_xml(run, font_family, is_cjk=is_cjk)
                         
                         logger.debug(f"Applied formatting to {len(cell.text_frame.paragraphs)} paragraph(s) "
-                                   f"in cell '{cell.text[:20]}': {font_family}, {font_size}pt, bold={is_bold_in_pdf}, "
-                                   f"align={text_alignment}")
+                                   f"in cell '{cell.text[:20]}': {font_family_raw}→{font_family}, {font_size}pt, "
+                                   f"bold={is_bold_in_pdf}, align={text_alignment}")
             
             # Apply cell merges after all cells are populated
             # Use the _detect_cell_merges method to identify merge regions from grid data
