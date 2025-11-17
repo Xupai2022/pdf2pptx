@@ -1092,7 +1092,11 @@ class PDFParser:
             # Remove redundant decorative borders (larger path borders that overlap with simpler rectangles)
             # This fixes the duplicate border issue on page 6 of season_report_del.pdf
             drawing_elements = self._remove_redundant_decorative_borders(drawing_elements)
-            
+
+            # Filter out legend container rectangles (black boxes that contain legend symbols)
+            # This fixes the issue on page 26 where chart legend is wrapped in a black rectangle
+            drawing_elements = self._filter_legend_container_rectangles(drawing_elements)
+
             # Now deduplicate overlapping shapes (removes border artifacts)
             drawing_elements = self._deduplicate_overlapping_shapes(drawing_elements)
             
@@ -1341,7 +1345,118 @@ class PDFParser:
             logger.info(f"Removed {removed_count} exact duplicate shape(s)")
         
         return unique_shapes
-    
+
+    def _filter_legend_container_rectangles(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filter out black-filled container rectangles that contain smaller legend symbols.
+
+        These are often artifact rectangles used in charting libraries to group legend items,
+        but they should not be rendered as visible black boxes in the output.
+
+        Detection criteria:
+        - Rectangle with black or very dark fill color (R,G,B all < 0.1)
+        - Has black or dark stroke (border)
+        - Contains 2+ smaller shapes inside it
+        - The smaller shapes have different colors (typical of legend symbols)
+
+        Args:
+            shapes: List of shape elements
+
+        Returns:
+            List of shapes with legend containers removed
+        """
+        if len(shapes) <= 2:
+            return shapes
+
+        filtered_shapes = []
+        skip_indices = set()
+
+        for i, container in enumerate(shapes):
+            if i in skip_indices:
+                continue
+
+            # Check if this could be a legend container
+            fill_color = container.get('fill_color')
+            stroke_color = container.get('stroke_color')
+
+            # Must have black/dark fill and stroke
+            is_black_fill = False
+            if fill_color:
+                # Parse hex color
+                if fill_color.startswith('#'):
+                    try:
+                        r = int(fill_color[1:3], 16) / 255.0
+                        g = int(fill_color[3:5], 16) / 255.0
+                        b = int(fill_color[5:7], 16) / 255.0
+                        is_black_fill = (r <= 0.1 and g <= 0.1 and b <= 0.1)
+                    except:
+                        pass
+
+            is_black_stroke = False
+            if stroke_color:
+                if stroke_color.startswith('#'):
+                    try:
+                        r = int(stroke_color[1:3], 16) / 255.0
+                        g = int(stroke_color[3:5], 16) / 255.0
+                        b = int(stroke_color[5:7], 16) / 255.0
+                        is_black_stroke = (r <= 0.1 and g <= 0.1 and b <= 0.1)
+                    except:
+                        pass
+
+            # If not a black fill+stroke rectangle, keep it
+            if not (is_black_fill and is_black_stroke):
+                filtered_shapes.append(container)
+                continue
+
+            # Get container bounds
+            cx, cy = container.get('x', 0), container.get('y', 0)
+            cw, ch = container.get('width', 0), container.get('height', 0)
+
+            # Find shapes inside this container
+            contained_shapes = []
+            for j, shape in enumerate(shapes):
+                if i == j or j in skip_indices:
+                    continue
+
+                sx, sy = shape.get('x', 0), shape.get('y', 0)
+                sw, sh = shape.get('width', 0), shape.get('height', 0)
+
+                # Check if shape is inside container (with small tolerance)
+                tolerance = 10
+                is_inside = (
+                    sx >= cx - tolerance and
+                    sy >= cy - tolerance and
+                    (sx + sw) <= (cx + cw) + tolerance and
+                    (sy + sh) <= (cy + ch) + tolerance and
+                    sw < cw and sh < ch  # Must be smaller
+                )
+
+                if is_inside:
+                    contained_shapes.append((j, shape))
+
+            # Black fill+stroke containers: filter if contains 2+ shapes with different colors
+            if len(contained_shapes) >= 2:
+                colors = set()
+                for _, shape in contained_shapes:
+                    fill = shape.get('fill_color')
+                    if fill:
+                        colors.add(fill)
+
+                if len(colors) >= 2:
+                    skip_indices.add(i)
+                    logger.debug(f"Filtered black legend container at ({cx:.1f}, {cy:.1f}), "
+                               f"size {cw:.1f}x{ch:.1f}, contains {len(contained_shapes)} shapes "
+                               f"with {len(colors)} different colors")
+                    continue
+
+            filtered_shapes.append(container)
+
+        removed_count = len(shapes) - len(filtered_shapes)
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} container rectangle(s)")
+
+        return filtered_shapes
+
     def _remove_redundant_decorative_borders(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Remove redundant decorative border shapes that overlap with simpler card border rectangles.
