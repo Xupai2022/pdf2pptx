@@ -67,20 +67,31 @@ class SlideModel:
         """Add an element to the slide."""
         self.elements.append(element)
     
-    def add_text(self, text: str, position: Dict[str, float], 
-                 style: Dict[str, Any], z_index: int = 0) -> SlideElement:
+    def add_text(self, text: str, position: Dict[str, float],
+                 style: Dict[str, Any], z_index: int = 0,
+                 rich_text_runs: Optional[List[Dict[str, Any]]] = None) -> SlideElement:
         """
         Add a text element to the slide.
-        
+
         Args:
-            text: Text content
+            text: Text content (used if rich_text_runs is None)
             position: Position dictionary
-            style: Style dictionary
+            style: Default style dictionary (used if rich_text_runs is None)
             z_index: Z-index for layering
-            
+            rich_text_runs: Optional list of rich text runs, each with 'text' and 'style'
+                           Example: [{'text': '事件', 'style': {...}},
+                                     {'text': '&', 'style': {...}}]
+
         Returns:
             Created SlideElement
         """
+        # 如果提供了rich_text_runs，将其存储在style中
+        if rich_text_runs:
+            style = style.copy() if style else {}
+            style['rich_text_runs'] = rich_text_runs
+            # 合并所有run的文本作为content
+            text = ''.join(run['text'] for run in rich_text_runs)
+
         element = SlideElement('text', position, text, style)
         element.z_index = z_index
         self.add_element(element)

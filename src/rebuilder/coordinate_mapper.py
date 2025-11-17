@@ -5,6 +5,7 @@ Coordinate Mapper - Maps PDF coordinates to PowerPoint coordinates
 import logging
 from typing import Dict, Any, Tuple
 from .slide_model import SlideModel, SlideElement
+from ..mapper.font_mapper import FontMapper
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,10 @@ class CoordinateMapper:
         self.pdf_to_html_scale = config.get('pdf_to_html_scale', 1.0)
         # Border width correction (PDF borders are thicker than expected)
         self.border_width_correction = config.get('border_width_correction', 1.0)
+        # 初始化字体映射器（传入完整config）
+        # FontMapper需要从全局config中读取font_mapping配置
+        parent_config = config.get('__parent__') if '__parent__' in config else {}
+        self.font_mapper = FontMapper(parent_config)
         logger.info(f"CoordinateMapper: slide {self.slide_width:.3f}×{self.slide_height:.3f}\", PDF scale: {self.pdf_to_html_scale}, border correction: {self.border_width_correction}")
     
     def create_slide_model(self, layout_data: Dict[str, Any]) -> SlideModel:
@@ -129,22 +134,38 @@ class CoordinateMapper:
         position = self._pdf_to_slide_coords(bbox, pdf_width, pdf_height)
         
         if role in ['title', 'subtitle', 'heading', 'text', 'paragraph', 'header', 'footer']:
-            # CRITICAL FIX: Create individual textboxes for each text element to prevent overlaps
-            # Issue: Previously, all text elements in a region were merged into one large textbox
-            # with the region's bbox, causing overlaps when Chinese text and numbers are adjacent.
-            # 
-            # Solution: Create separate textboxes for each text element using its own bbox.
-            # This preserves the precise positioning from PDF and prevents artificial overlaps.
-            
-            # Check if this region contains multiple discrete text elements
-            # If so, create individual textboxes instead of merging
+            # 优先使用layout_analyzer合并后的文本
+            # 如果region已经有合并好的text，说明layout_analyzer已经智能处理过，直接使用
+            # 只有在没有合并文本时，才为每个element创建单独的文本框
+
+            merged_text = region.get('text', '')
             text_elements = [e for e in elements if e.get('type') == 'text']
-            
-            if len(text_elements) > 1:
-                # Multiple text elements - create individual textboxes for each
-                # Group elements by line (same Y position) and process each line
-                # This allows us to fix overlaps within each line
-                
+
+            # 关键判断：如果有合并文本，优先使用合并文本创建单个文本框
+            if merged_text and len(text_elements) > 1:
+                # layout_analyzer已经智能合并了文本（含空格），需要将其拆分成富文本runs
+                # 同时保留每个element的独立样式
+                logger.debug(f"Using merged text for region with {len(text_elements)} elements: '{merged_text[:50]}'")
+
+                # 按X坐标排序elements（与layout_analyzer的合并顺序一致）
+                sorted_elements = sorted(text_elements, key=lambda e: e.get('x', 0))
+
+                # 智能构建富文本runs，匹配merged_text和elements
+                rich_text_runs = self._build_rich_text_runs(merged_text, sorted_elements)
+
+                # 使用第一个element的样式作为默认样式
+                default_style = self._extract_text_style(elements)
+
+                # Set as title if it's a title role
+                if role == 'title':
+                    slide.set_title(merged_text)
+
+                slide.add_text(merged_text, position, default_style, z_index, rich_text_runs=rich_text_runs)
+            elif len(text_elements) > 1:
+                # 没有合并文本但有多个elements，为每个element创建单独文本框
+                # 这种情况应该很少见（说明layout_analyzer没有合并）
+                logger.debug(f"Creating individual textboxes for {len(text_elements)} elements (no merged text)")
+
                 # Group by line
                 lines = {}
                 for elem in text_elements:
@@ -152,33 +173,30 @@ class CoordinateMapper:
                     if y_key not in lines:
                         lines[y_key] = []
                     lines[y_key].append(elem)
-                
+
                 # Process each line
                 for y_key in sorted(lines.keys()):
                     line_elements = sorted(lines[y_key], key=lambda e: e.get('x', 0))
-                    
+
                     # Track the rightmost x2 to prevent overlaps
                     prev_x2 = None
-                    
+
                     for i, elem in enumerate(line_elements):
                         text = elem.get('content', '')
                         if text:
                             elem_bbox = [elem['x'], elem['y'], elem['x2'], elem['y2']]
-                            
+
                             # OVERLAP FIX: Ensure no overlaps with previous element on same line
-                            # PDF may have micro-overlaps (<1pt) or even larger overlaps
                             if prev_x2 is not None:
                                 gap = elem_bbox[0] - prev_x2
-                                # If overlap detected (gap < 0), shift this element right
                                 if gap < 0:
-                                    shift = abs(gap) + 0.5  # Add 0.5pt buffer
+                                    shift = abs(gap) + 0.5
                                     elem_bbox[0] = prev_x2 + 0.5
-                                    elem_bbox[2] = elem_bbox[0] + (elem['x2'] - elem['x'])  # Keep width
+                                    elem_bbox[2] = elem_bbox[0] + (elem['x2'] - elem['x'])
                                     logger.debug(f"Fixed overlap: '{text[:20]}' shifted right by {shift:.2f}pt")
-                            
-                            # Update prev_x2 for next element
+
                             prev_x2 = elem_bbox[2]
-                            
+
                             elem_position = self._pdf_to_slide_coords(elem_bbox, pdf_width, pdf_height)
                             elem_style = {
                                 'font_name': elem.get('font_name', 'Arial'),
@@ -188,22 +206,21 @@ class CoordinateMapper:
                                 'italic': elem.get('is_italic', False),
                                 'rotation': elem.get('rotation', 0)
                             }
-                            
-                            # Title role is only for the first element
+
                             if role == 'title' and elem == line_elements[0] and y_key == min(lines.keys()):
                                 slide.set_title(text)
-                            
+
                             slide.add_text(text, elem_position, elem_style, z_index)
             else:
-                # Single text element or merged region - use region bbox
-                text = region.get('text', '')
+                # Single text element - use region bbox
+                text = merged_text if merged_text else region.get('text', '')
                 if not text:
                     # Fallback: merge element text manually
                     text = self._merge_element_text(elements)
-                
+
                 if text:
                     style = self._extract_text_style(elements)
-                    
+
                     # Set as title if it's a title role
                     if role == 'title':
                         slide.set_title(text)
@@ -401,7 +418,95 @@ class CoordinateMapper:
         }
         
         return style
-    
+
+    def _build_rich_text_runs(self, merged_text: str, sorted_elements: list) -> list:
+        """
+        将合并后的文本拆分成富文本runs，匹配每个element的样式
+
+        Args:
+            merged_text: layout_analyzer合并后的文本（含空格）
+            sorted_elements: 按X坐标排序的text elements
+
+        Returns:
+            富文本runs列表，每个run包含text和style
+        """
+        runs = []
+        text_pos = 0  # 当前在merged_text中的位置
+
+        for i, elem in enumerate(sorted_elements):
+            elem_content = elem.get('content', '')
+            if not elem_content:
+                continue
+
+            # 在merged_text中查找当前element的content
+            find_pos = merged_text.find(elem_content, text_pos)
+
+            if find_pos == -1:
+                # 找不到，可能是文本被修改了，记录警告并继续
+                logger.warning(f"Cannot find element content '{elem_content}' in merged text at pos {text_pos}")
+                continue
+
+            # 如果find_pos > text_pos，说明中间有空格或其他字符
+            if find_pos > text_pos:
+                # 添加空格run（使用前一个element的样式，或当前element的样式）
+                space_text = merged_text[text_pos:find_pos]
+                prev_elem = sorted_elements[i-1] if i > 0 else elem
+                # 应用字体映射
+                prev_font = prev_elem.get('font_name', 'Arial')
+                mapped_prev_font = self.font_mapper.map_font(prev_font)
+                space_style = {
+                    'font_name': mapped_prev_font,
+                    'font_size': prev_elem.get('font_size', 18),
+                    'color': prev_elem.get('color', '#000000'),
+                    'bold': prev_elem.get('is_bold', False),
+                    'italic': prev_elem.get('is_italic', False),
+                }
+                runs.append({
+                    'text': space_text,
+                    'style': space_style
+                })
+
+            # 添加当前element的run
+            # 应用字体映射（MicrosoftYaHei-Bold → 微软雅黑）
+            elem_font = elem.get('font_name', 'Arial')
+            mapped_font = self.font_mapper.map_font(elem_font)
+            elem_style = {
+                'font_name': mapped_font,
+                'font_size': elem.get('font_size', 18),
+                'color': elem.get('color', '#000000'),
+                'bold': elem.get('is_bold', False),
+                'italic': elem.get('is_italic', False),
+            }
+            runs.append({
+                'text': elem_content,
+                'style': elem_style
+            })
+
+            # 更新位置
+            text_pos = find_pos + len(elem_content)
+
+        # 处理末尾可能的剩余字符（如换行符）
+        if text_pos < len(merged_text):
+            remaining = merged_text[text_pos:]
+            last_elem = sorted_elements[-1] if sorted_elements else None
+            if last_elem:
+                # 应用字体映射
+                last_font = last_elem.get('font_name', 'Arial')
+                mapped_last_font = self.font_mapper.map_font(last_font)
+                remaining_style = {
+                    'font_name': mapped_last_font,
+                    'font_size': last_elem.get('font_size', 18),
+                    'color': last_elem.get('color', '#000000'),
+                    'bold': last_elem.get('is_bold', False),
+                    'italic': last_elem.get('is_italic', False),
+                }
+                runs.append({
+                    'text': remaining,
+                    'style': remaining_style
+                })
+
+        return runs
+
     def _merge_element_text(self, elements: list) -> str:
         """
         Merge text from multiple elements.

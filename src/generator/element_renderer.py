@@ -6,6 +6,7 @@ import logging
 import io
 from typing import Dict, Any, List
 from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
 from ..rebuilder.slide_model import SlideElement
 from ..mapper.style_mapper import StyleMapper
@@ -123,26 +124,52 @@ class ElementRenderer:
         width = Inches(position['width'])
         height = Inches(position['height'])
         
-        # ANTI-OVERLAP FIX: Add small gap to prevent adjacent text boxes from overlapping
-        # PDF text boxes that are touching (x2 of one == x of next) can overlap in PowerPoint
-        # due to font rendering differences. We add a tiny gap to the left position
-        # and slightly reduce width to ensure separation.
-        #
-        # Strategy:
-        # 1. Add 1pt gap to left position (shifts text slightly right)
-        # 2. Reduce width by 2pt (prevents text from extending too far right)
-        # 3. This creates ~3pt total separation between adjacent text boxes
-        #
-        # Example: "事件" + "&" in PDF are touching at x=107.76
-        # - "事件": x=94.16->107.76 becomes left=1.32", width=0.17" (was 1.31", 0.19")  
-        # - "&": x=107.76->112.70 becomes left=1.51", width=0.05" (was 1.50", 0.07")
-        # This ensures the gap of ~2pt between them
-        anti_overlap_left_gap = 1.0 / 72.0  # 1pt shift right
-        anti_overlap_width_reduction = 2.0 / 72.0  # 2pt reduction
-        
-        left += Inches(anti_overlap_left_gap)
-        if width.inches > anti_overlap_width_reduction * 2:  # Only if width is large enough
-            width -= Inches(anti_overlap_width_reduction)
+        # ANTI-OVERLAP FIX: 只在非富文本模式下应用防重叠调整
+        # 富文本模式下所有文本在同一个文本框，不需要防重叠调整
+        # 而且需要保持完整宽度以防止文本换行
+        is_rich_text = style.get('rich_text_runs') is not None
+
+        if not is_rich_text:
+            # 非富文本模式：应用防重叠调整
+            anti_overlap_left_gap = 2.0 / 72.0  # 2pt shift right
+            anti_overlap_width_reduction = 3.0 / 72.0  # 3pt reduction
+
+            left += Inches(anti_overlap_left_gap)
+            if width.inches > anti_overlap_width_reduction * 2:
+                width -= Inches(anti_overlap_width_reduction)
+        else:
+            # 富文本模式：计算文本实际需要的宽度，确保不换行
+            # 获取富文本runs信息
+            runs = style.get('rich_text_runs', [])
+            if runs:
+                # 估算每个run的宽度
+                estimated_width_pt = 0
+                for run in runs:
+                    text = run['text']
+                    run_style = run['style']
+                    font_size = run_style.get('font_size', 18)
+
+                    # 估算宽度：
+                    # - 中文字符：宽度 ≈ 字号 (1:1比例)
+                    # - 英文/数字：宽度 ≈ 字号 × 0.6
+                    # - 空格：宽度 ≈ 字号 × 0.3
+                    for char in text:
+                        if '\u4e00' <= char <= '\u9fff':  # 中文
+                            estimated_width_pt += font_size
+                        elif char == ' ':  # 空格
+                            estimated_width_pt += font_size * 0.3
+                        elif char == '\n':  # 换行符不占宽度
+                            pass
+                        else:  # 英文、数字、符号
+                            estimated_width_pt += font_size * 0.6
+
+                # 转换为英寸并增加20%缓冲
+                estimated_width_inches = (estimated_width_pt / 72.0) * 1.2
+
+                # 如果估算宽度大于当前宽度，扩展文本框
+                if estimated_width_inches > width.inches:
+                    logger.debug(f"Expanding textbox width: {width.inches:.3f}\" → {estimated_width_inches:.3f}\" for text: '{content[:30]}'")
+                    width = Inches(estimated_width_inches)
         
         # Check if this is rotated text
         rotation = style.get('rotation', 0)
@@ -186,14 +213,64 @@ class ElementRenderer:
         try:
             textbox = slide.shapes.add_textbox(left, top, width, height)
             text_frame = textbox.text_frame
-            text_frame.text = content
-            
-            # Apply style
-            self.style_mapper.apply_text_style(text_frame, style)
-            
+
+            # 检查是否有富文本runs（多个样式）
+            rich_text_runs = style.get('rich_text_runs')
+
+            if rich_text_runs:
+                # 富文本模式：为每个run应用独立样式
+                text_frame.clear()  # 清除默认段落
+
+                paragraph = text_frame.paragraphs[0]
+                for i, run_info in enumerate(rich_text_runs):
+                    run_text = run_info['text']
+                    run_style = run_info['style']
+
+                    # 添加run
+                    if i == 0:
+                        # 第一个run使用现有paragraph
+                        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+                        run.text = run_text
+                    else:
+                        run = paragraph.add_run()
+                        run.text = run_text
+
+                    # 应用run的独立样式（字体、字号、颜色等）
+                    font_name = run_style.get('font_name', 'Arial')
+                    run.font.name = font_name
+                    run.font.size = Pt(run_style.get('font_size', 18))
+                    run.font.bold = run_style.get('bold', False)
+                    run.font.italic = run_style.get('italic', False)
+
+                    # 应用颜色
+                    color = run_style.get('color', '#000000')
+                    if color and color.startswith('#'):
+                        try:
+                            rgb = tuple(int(color[i:i+2], 16) for i in (1, 3, 5))
+                            run.font.color.rgb = RGBColor(*rgb)
+                        except:
+                            pass
+
+                    # 为中文字体设置东亚字体（确保中文正确显示）
+                    if is_cjk_font(font_name):
+                        try:
+                            set_run_font_xml(run, font_name)
+                        except:
+                            pass
+
+                logger.debug(f"Applied rich text with {len(rich_text_runs)} runs: '{content[:50]}'")
+            else:
+                # 普通文本模式：统一样式
+                text_frame.text = content
+
+                # Apply style
+                self.style_mapper.apply_text_style(text_frame, style)
+
             # Text frame properties
-            # Disable word wrap to prevent forced line breaks
-            text_frame.word_wrap = False
+            # 如果内容包含换行符（多行段落），启用word_wrap以支持换行显示
+            # 否则禁用word_wrap以防止单行文本强制换行
+            has_newlines = '\n' in content
+            text_frame.word_wrap = has_newlines
             
             # Apply rotation if specified
             rotation = style.get('rotation', 0)
