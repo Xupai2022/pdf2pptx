@@ -656,34 +656,60 @@ class ElementRenderer:
                     if text_elements and len(text_elements) > 1:
                         # Check if text elements have different Y positions (multiple lines)
                         # Group text elements by Y position with 3pt tolerance
+                        # CRITICAL FIX: Use distance-based grouping instead of grid-based grouping
+                        # Issue: round(202.45/3.0)*3.0 = 201.0, round(202.97/3.0)*3.0 = 204.0
+                        # Even though they differ by only 0.52pt, they get different y_keys!
+                        # Solution: Group by actual distance between elements
                         y_tolerance = 3.0
-                        y_groups = {}
-                        
-                        for text_elem in text_elements:
+                        y_groups = []  # List of lists instead of dict
+
+                        # Sort by Y position
+                        sorted_text_elements = sorted(text_elements, key=lambda e: e.get('y', 0))
+
+                        for text_elem in sorted_text_elements:
                             y = text_elem.get('y', 0)
-                            y_key = round(y / y_tolerance) * y_tolerance
-                            if y_key not in y_groups:
-                                y_groups[y_key] = []
-                            y_groups[y_key].append(text_elem)
+
+                            # Find an existing group within tolerance
+                            assigned = False
+                            for group in y_groups:
+                                # Check distance to any element in this group
+                                for existing_elem in group:
+                                    existing_y = existing_elem.get('y', 0)
+                                    if abs(y - existing_y) <= y_tolerance:
+                                        group.append(text_elem)
+                                        assigned = True
+                                        break
+                                if assigned:
+                                    break
+
+                            # Create new group if not assigned
+                            if not assigned:
+                                y_groups.append([text_elem])
                         
                         # If multiple Y groups, rebuild text with line breaks
                         if len(y_groups) > 1:
-                            sorted_y_keys = sorted(y_groups.keys())
                             line_texts = []
-                            
-                            for y_key in sorted_y_keys:
+
+                            for group in y_groups:
                                 # Sort text elements in this line by X position
-                                line_elements = sorted(y_groups[y_key], key=lambda e: e.get('x', 0))
+                                line_elements = sorted(group, key=lambda e: e.get('x', 0))
                                 line_text = ''.join(e.get('content', e.get('text', '')) for e in line_elements)
                                 line_texts.append(line_text)
-                            
+
                             # Join lines with newline character
                             cell_text = '\n'.join(line_texts)
                             logger.debug(f"Detected {len(line_texts)} lines in cell, added line breaks: {line_texts}")
                     
                     # Set cell text
                     cell.text = cell_text
-                    
+
+                    # CRITICAL FIX: Set vertical alignment to MIDDLE (center)
+                    # PDF table cells typically have text vertically centered
+                    # PowerPoint defaults to TOP alignment, which looks incorrect
+                    from pptx.enum.text import MSO_ANCHOR
+                    cell.text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+                    logger.debug(f"Set vertical alignment to MIDDLE for cell '{cell_text[:20]}'")
+
                     # CRITICAL FIX: Use MINIMAL margins to allow row height matching PDF
                     # Issue: PowerPoint adds internal padding on top of our margin settings
                     # When we set margin = 3.76pt, PowerPoint renders ~5-6pt actual margin
