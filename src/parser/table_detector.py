@@ -208,16 +208,18 @@ class TableDetector:
                 continue
             
             # LENIENT filtering for normal-height shapes (height >= 20pt)
-            # Only filter extremely wide bars (> 25:1) to catch title/section bars
-            if height >= 20 and aspect_ratio > 25:
-                logger.debug(f"Filtered wide decorative bar: {width:.1f}x{height:.1f}pt (aspect ratio {aspect_ratio:.1f}:1 > 25:1)")
-                continue
-            
+            # CRITICAL FIX: Don't immediately filter wide bars (aspect_ratio > 25)
+            # because they might be merged table headers (e.g., Page 30: 864.7x28.8pt, ratio=30:1)
+            # Instead, mark them as suspicious and validate in second pass based on X-alignment
+
             # Has stroke or fill (visible cell)
             has_stroke = shape.get('stroke_color') is not None
             has_fill = shape.get('fill_color') is not None
-            
+
             if has_stroke or has_fill:
+                # Mark wide bars for second-pass validation
+                if height >= 20 and aspect_ratio > 25:
+                    shape['_suspicious_wide_bar'] = True
                 candidates.append(shape)
         
         if not candidates:
@@ -283,8 +285,48 @@ class TableDetector:
         
         logger.info(f"Filtered {len(candidates)} -> {len(filtered_candidates)} cell candidates "
                    f"(removed {len(candidates) - len(filtered_candidates)} backgrounds)")
-        
-        return filtered_candidates
+
+        # CRITICAL FIX: Third pass - validate suspicious wide bars
+        # Check if they align with normal cells (merged table headers) or are isolated (decorative bars)
+        suspicious_bars = [c for c in filtered_candidates if c.get('_suspicious_wide_bar')]
+        normal_cells = [c for c in filtered_candidates if not c.get('_suspicious_wide_bar')]
+
+        if suspicious_bars and normal_cells:
+            # Collect X positions of normal cells (with tolerance)
+            tolerance = 5.0  # 5pt tolerance for X-alignment
+            normal_x_positions = set()
+            for cell in normal_cells:
+                x = cell['x']
+                # Round to tolerance
+                x_rounded = round(x / tolerance) * tolerance
+                normal_x_positions.add(x_rounded)
+
+            # Validate each suspicious bar
+            final_candidates = list(normal_cells)  # Start with all normal cells
+            for bar in suspicious_bars:
+                bar_x = round(bar['x'] / tolerance) * tolerance
+
+                # Check if bar's X position aligns with any normal cell's X position
+                if bar_x in normal_x_positions:
+                    # Aligned - likely merged table header, keep it
+                    logger.info(f"Kept wide bar {bar['width']:.1f}x{bar['height']:.1f}pt at X={bar['x']:.1f} "
+                               f"(aligned with normal cells, likely merged header)")
+                    # Remove the marker
+                    if '_suspicious_wide_bar' in bar:
+                        del bar['_suspicious_wide_bar']
+                    final_candidates.append(bar)
+                else:
+                    # Not aligned - decorative bar, filter it out
+                    logger.debug(f"Filtered decorative bar {bar['width']:.1f}x{bar['height']:.1f}pt at X={bar['x']:.1f} "
+                                f"(not aligned with table cells)")
+
+            return final_candidates
+        else:
+            # No suspicious bars or no normal cells - return as is
+            for c in filtered_candidates:
+                if '_suspicious_wide_bar' in c:
+                    del c['_suspicious_wide_bar']
+            return filtered_candidates
     
     def _detect_line_based_tables(self, shapes: List[Dict[str, Any]], 
                                   page: fitz.Page) -> List[Dict[str, Any]]:
@@ -366,22 +408,41 @@ class TableDetector:
                 
                 # Calculate gaps between consecutive columns
                 if len(col_x_positions) >= 2:
-                    gaps = [col_x_positions[i+1] - col_x_positions[i] 
+                    gaps = [col_x_positions[i+1] - col_x_positions[i]
                            for i in range(len(col_x_positions) - 1)]
-                    
-                    # If there's a gap > 20pt between columns, it's likely two separate regions
-                    # CRITICAL: This threshold should be smaller than typical column spacing
-                    # but larger than typical cell borders (which are < 5pt)
+
                     max_gap = max(gaps) if gaps else 0
                     median_gap = sorted(gaps)[len(gaps)//2] if gaps else 0
-                    
-                    # Reject if max gap is > 3x median gap AND > 20pt (indicates discontinuity)
-                    if max_gap > 20 and (median_gap == 0 or max_gap > median_gap * 3):
+                    table_width = col_x_positions[-1] - col_x_positions[0]
+
+                    # Changed: Use relative threshold based on table width instead of fixed ratio
+                    # This allows wide columns (e.g., description columns in reports) while still
+                    # detecting disconnected regions (e.g., chart + table)
+                    # Reject if:
+                    # 1. Absolute threshold: gap > 600pt (extremely wide, likely disconnected)
+                    # 2. Relative threshold: gap > 80% of table width (indicates separation)
+                    # 3. Ratio threshold: gap > 4.5x median (was 3x, balanced for wide columns)
+                    # 4. Column count check: > 8 columns AND median_ratio > 1.5 (likely over-merged)
+                    gap_ratio = max_gap / table_width if table_width > 0 else 0
+                    median_ratio = max_gap / median_gap if median_gap > 0 else 0
+                    num_cols = len(col_x_positions) - 1  # Actual columns = positions - 1
+
+                    # Additional check: reject tables with excessive columns (likely over-merged)
+                    # Tables with > 8 columns AND any significant gap are suspicious
+                    over_merged = num_cols > 8 and median_ratio > 1.5
+
+                    if max_gap > 600 or gap_ratio > 0.8 or (max_gap > 20 and median_ratio > 4.5) or over_merged:
                         logger.info(f"Rejected line-based table: columns have large gap "
-                                   f"(max_gap={max_gap:.1f}pt, median={median_gap:.1f}pt), "
-                                   f"likely spans disconnected regions")
+                                   f"(max_gap={max_gap:.1f}pt, median={median_gap:.1f}pt, "
+                                   f"gap_ratio={gap_ratio:.1%}, median_ratio={median_ratio:.1f}x, cols={num_cols}), "
+                                   f"{'over-merged (cols > 8)' if over_merged else 'likely spans disconnected regions'}")
                         return []
-            
+                    else:
+                        # Log gap data for accepted tables to help diagnose issues
+                        logger.debug(f"Accepted line-based table gap check: max_gap={max_gap:.1f}pt, "
+                                    f"median={median_gap:.1f}pt, gap_ratio={gap_ratio:.1%}, "
+                                    f"median_ratio={median_ratio:.1f}x, cols={num_cols}")
+
             logger.info(f"Detected line-based table: {table['rows']}x{table['cols']} grid")
             return [table]
         
@@ -512,17 +573,23 @@ class TableDetector:
         col_positions = sorted(v_line_groups.keys())
         
         # CRITICAL CHECK: Detect horizontal gaps in column positions
-        # If there's a large gap (> 50pt) between columns, it indicates
-        # two separate regions that should NOT be merged into one table
+        # Changed from fixed 50pt threshold to relative threshold based on table width
+        # This allows wide columns (e.g., description columns in reports) while still
+        # detecting disconnected regions (e.g., chart + table merged incorrectly)
         if len(col_positions) >= 2:
-            gaps = [col_positions[i+1] - col_positions[i] 
+            gaps = [col_positions[i+1] - col_positions[i]
                    for i in range(len(col_positions) - 1)]
             max_gap = max(gaps) if gaps else 0
-            
-            # If max gap > 50pt, reject this table (likely spans disconnected regions)
-            if max_gap > 50:
+            table_width = col_positions[-1] - col_positions[0]
+
+            # Reject only if gap is both large AND disproportionate
+            # - Absolute threshold: > 600pt (unusually wide single column)
+            # - Relative threshold: > 80% of table width (indicates separation, not wide column)
+            gap_ratio = max_gap / table_width if table_width > 0 else 0
+            if max_gap > 600 or gap_ratio > 0.8:
                 logger.info(f"Rejected line-based table: columns have large gap "
-                           f"(max_gap={max_gap:.1f}pt), likely spans disconnected regions "
+                           f"(max_gap={max_gap:.1f}pt, gap_ratio={gap_ratio:.1%}, "
+                           f"table_width={table_width:.1f}pt), likely spans disconnected regions "
                            f"(e.g., chart + table)")
                 return None
         
@@ -833,59 +900,96 @@ class TableDetector:
                 # Only consider non-negative gaps
                 if actual_gap >= 0:
                     gap_center = (col_right_edge + next_col_x) / 2
-                    gaps.append((visual_gap, gap_center))
+                    # Store tuple: (visual_gap, actual_gap, gap_center)
+                    gaps.append((visual_gap, actual_gap, gap_center))
                     logger.info(f"Column gap: X={col_x:.1f} (width={col_width:.1f}, right={col_right_edge:.1f}) "
                                f"to next X={next_col_x:.1f}, actual_gap={actual_gap:.1f}pt, "
                                f"visual_gap={visual_gap:.1f}pt")
-            
-            # Sort gaps by size (descending)
-            gaps.sort(reverse=True)
-            
+
+            # Sort gaps by visual size (descending) for detection
+            gaps.sort(reverse=True, key=lambda g: g[0])
+
             # CRITICAL FIX: Handle case where no valid gaps found (all columns overlap or touch)
             if not gaps:
                 logger.debug("Column clustering: No valid gaps found (all columns touch or overlap)")
                 # No gaps means single contiguous table
                 return [cells]
-            
-            largest_gap, largest_gap_pos = gaps[0]
-            
+
+            largest_visual_gap, largest_actual_gap, largest_gap_pos = gaps[0]
+
             # IMPROVED STRATEGY: Calculate typical column spacing (median of smaller gaps)
             # Exclude the largest gap (potential table separator) when calculating typical spacing
-            smaller_gaps = [g[0] for g in gaps[1:]]  # Skip largest gap
+            smaller_gaps = [g[0] for g in gaps[1:]]  # Skip largest gap (use visual gap)
             if smaller_gaps:
                 smaller_gaps.sort()
                 median_gap = smaller_gaps[len(smaller_gaps) // 2]
             else:
                 median_gap = 0
-            
-            # STRICT CRITERIA for table separation (using visual gaps):
-            # Strategy 1: Absolute threshold - gap >= 80pt (visual gap, including wide column bonus)
-            # Strategy 2: Relative threshold - gap >= 2x median gap
-            # 
-            # Examples with NEW visual gap calculation:
-            # - Page 12: Col 0 (40.8pt) gap to Col 1 = 0pt, no bonus -> visual_gap=0pt (no split) ✓
-            # - Page 10: Col 2 (230.4pt) gap to Col 3 = 7.9pt + 80.4pt bonus -> visual_gap=88.3pt (split) ✓
-            # - Page 7: Normal column gaps, no wide columns -> use relative ratio check
+
+            # ENHANCED CRITERIA for table separation (using visual gaps):
+            # Strategy 1: Absolute threshold - gap >= 50pt (for large gaps)
+            # Strategy 2: Relative threshold - gap >= 3.5x median (for significant separations)
+            # Strategy 3: Medium gap - 15pt <= actual_gap < 50pt with median=0 (single gap case)
             #
-            # IMPORTANT: Lowered absolute threshold from 200pt to 80pt to catch side-by-side tables
-            # where visual separation comes from wide column bonus rather than actual spacing
-            min_gap_threshold = 80  # pt - visual gap threshold
-            min_ratio = 2.5  # Relative threshold (slightly higher since we lowered absolute threshold)
-            
-            if (largest_gap >= min_gap_threshold and 
-                (median_gap == 0 or largest_gap >= median_gap * min_ratio)):
+            # Examples with visual gap calculation:
+            # - Page 12: Col gap = 0pt, no bonus -> visual_gap=0pt (no split) ✓
+            # - Page 10: Col gap = 7.9pt + 80.4pt bonus -> visual_gap=88.3pt (split) ✓
+            # - Page 24: visual_gap = 40.8pt < 50pt, actual_gap=0pt (no split) ✓
+            # - Page 41 (Fixed): actual_gap = 15.1pt, median=0pt -> split via medium gap rule ✓
+            #
+            # OPTIMIZATION: Balanced threshold at 50pt to avoid false splits while
+            # using medium gap rule (15-50pt actual gap with median=0) to catch true separators
+            min_gap_threshold = 50  # pt - visual gap threshold (balanced for reliability)
+            min_ratio = 3.5  # Relative threshold (raised to avoid false positives)
+            significant_ratio = 3.5  # Significant gap ratio threshold
+
+            ratio_str = f"{largest_visual_gap/median_gap:.1f}" if median_gap > 0 else 'inf'
+
+            # Check if gap meets split criteria:
+            # 1. Absolute: visual_gap >= 50pt (for large visual separations)
+            # 2. Significant relative: visual_gap >= 3.5x median (for obvious separations)
+            # 3. Medium gap: 15pt <= actual_gap < 50pt with median=0 (single real gap case)
+            should_split = False
+            split_reason = ""
+
+            if largest_visual_gap >= min_gap_threshold and (median_gap == 0 or largest_visual_gap >= median_gap * min_ratio):
+                # CRITICAL FIX: When relying on wide_column_bonus, require actual_gap > 5pt
+                # to avoid splitting single tables with wide columns that touch each other.
+                # Example: Page 30 has wide column (259.2pt) touching next column (actual_gap=0pt)
+                # which gets 109.2pt bonus -> visual_gap=109.2pt, triggering false split.
+                # Real side-by-side tables (Page 28) have actual_gap > 5pt even before bonus.
+                wide_col_bonus_used = largest_visual_gap - largest_actual_gap > 50  # bonus contributed >50pt
+                if wide_col_bonus_used and largest_actual_gap <= 5:
+                    # Wide column bonus was used but actual gap is tiny/zero -> likely same table
+                    logger.debug(f"Absolute threshold: visual_gap={largest_visual_gap:.1f}pt >= {min_gap_threshold}pt "
+                                f"BUT actual_gap={largest_actual_gap:.1f}pt <= 5pt with wide_col_bonus "
+                                f"-> likely single table with wide columns, NO SPLIT")
+                else:
+                    should_split = True
+                    split_reason = f"absolute threshold (visual_gap={largest_visual_gap:.1f}pt >= {min_gap_threshold}pt, actual_gap={largest_actual_gap:.1f}pt, median={median_gap:.1f}pt)"
+            elif median_gap > 0 and largest_visual_gap >= median_gap * significant_ratio:
+                should_split = True
+                split_reason = f"significant gap ratio (visual_gap={largest_visual_gap:.1f}pt, ratio={ratio_str}x >= {significant_ratio}x)"
+            elif median_gap == 0 and 15 <= largest_actual_gap < min_gap_threshold:
+                # Special case for medium gaps (15-50pt actual gap) with zero median
+                # Use ACTUAL gap (not visual) to avoid wide column bonus interference
+                # This handles cases like Page 41 (actual 15.1pt gap) while avoiding Page 30 (0pt gap)
+                # The 15pt threshold catches legitimate side-by-side tables with modest gaps
+                should_split = True
+                split_reason = f"medium actual gap with zero median (actual_gap={largest_actual_gap:.1f}pt in [15, {min_gap_threshold}), median=0pt)"
+
+            if should_split:
                 consistent_gaps.append(largest_gap_pos)
-                ratio_str = f"{largest_gap/median_gap:.1f}" if median_gap > 0 else 'inf'
                 logger.info(f"Detected horizontal split via column clustering: "
-                           f"largest gap {largest_gap:.1f}pt (median gap: {median_gap:.1f}pt, "
-                           f"ratio: {ratio_str}x) "
+                           f"visual_gap={largest_visual_gap:.1f}pt, actual_gap={largest_actual_gap:.1f}pt "
+                           f"(median: {median_gap:.1f}pt, ratio: {ratio_str}x) "
                            f"at X≈{largest_gap_pos:.1f} "
-                           f"(column positions: {[f'{x:.0f}' for x in sorted_col_x]})")
+                           f"(column positions: {[f'{x:.0f}' for x in sorted_col_x]}) "
+                           f"[reason: {split_reason}]")
             else:
-                ratio_str = f"{largest_gap/median_gap:.1f}" if median_gap > 0 else 'inf'
-                logger.debug(f"Column clustering: No clear split (largest gap={largest_gap:.1f}pt, "
-                            f"median gap={median_gap:.1f}pt, "
-                            f"ratio={ratio_str}x < {min_ratio}x or gap < 200pt)")
+                logger.debug(f"Column clustering: No clear split (visual_gap={largest_visual_gap:.1f}pt, "
+                            f"actual_gap={largest_actual_gap:.1f}pt, median={median_gap:.1f}pt, "
+                            f"ratio={ratio_str}x < {min_ratio}x or gap < {min_gap_threshold}pt)")
         
         # Step 4: Split cells into groups based on consistent gaps
         if not consistent_gaps:
@@ -1184,13 +1288,26 @@ class TableDetector:
         # CRITICAL FIX: Collect consecutive rows both forwards AND backwards
         # This handles sparse columns where header/footer have more columns than data rows
         table_rows = [first_row]
-        
+
         # Collect rows forwards (after start_idx)
         for i in range(start_idx + 1, len(rows)):
             row = rows[i]
-            row_col_positions = sorted([round(cell['x'] / self.alignment_tolerance) * 
+            row_col_positions = sorted([round(cell['x'] / self.alignment_tolerance) *
                                        self.alignment_tolerance for cell in row])
-            
+
+            # CRITICAL FIX: Check row spacing to avoid including isolated elements
+            # If this row is too far from the last collected row (>50pt gap), stop collecting
+            # This filters out unrelated elements like page decorations or text boxes above/below table
+            # Example: Page 30 has cells at Y=74.2, 84.2 (decorations) far from table at Y=188.6
+            if table_rows:
+                last_row_y = max(cell['y2'] for cell in table_rows[-1])
+                current_row_y = min(cell['y'] for cell in row)
+                row_gap = current_row_y - last_row_y
+
+                if row_gap > 50:  # 50pt threshold for row separation
+                    logger.debug(f"Forward row {i}: row_gap={row_gap:.1f}pt > 50pt, stopping (isolated element)")
+                    break
+
             # Check if columns roughly match
             match_result = self._columns_match(first_row_col_positions, row_col_positions)
             logger.debug(f"Forward row {i}: cols={row_col_positions} vs reference={first_row_col_positions}, match={match_result}")
@@ -1203,9 +1320,20 @@ class TableDetector:
         # This handles cases where we start from a footer row with all columns
         for i in range(start_idx - 1, -1, -1):
             row = rows[i]
-            row_col_positions = sorted([round(cell['x'] / self.alignment_tolerance) * 
+            row_col_positions = sorted([round(cell['x'] / self.alignment_tolerance) *
                                        self.alignment_tolerance for cell in row])
-            
+
+            # CRITICAL FIX: Check row spacing in backward direction too
+            # If this row is too far from the first collected row (>50pt gap), stop collecting
+            if table_rows:
+                first_collected_y = min(cell['y'] for cell in table_rows[0])
+                current_row_y2 = max(cell['y2'] for cell in row)
+                row_gap = first_collected_y - current_row_y2
+
+                if row_gap > 50:  # 50pt threshold for row separation
+                    logger.debug(f"Backward row {i}: row_gap={row_gap:.1f}pt > 50pt, stopping (isolated element)")
+                    break
+
             # Check if columns roughly match
             match_result = self._columns_match(first_row_col_positions, row_col_positions)
             logger.debug(f"Backward row {i}: cols={row_col_positions} vs reference={first_row_col_positions}, match={match_result}")

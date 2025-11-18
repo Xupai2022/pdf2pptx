@@ -107,7 +107,12 @@ class ChartDetector:
             # CRITICAL FIX: Increase minimum size to filter out small decorative elements
             # Small icons, bullets, and decorative circles (< 15pt) should not be chart candidates
             # Real chart elements (pie sectors, bars, etc.) are typically larger
-            if width < 15 or height < 15:
+            #
+            # IMPORTANT: BUT don't filter out lines! Chart grid lines have width=0 or height=0
+            # and are essential components of bar/line charts
+            is_line = (width < 2 and height >= 15) or (height < 2 and width >= 15)
+
+            if not is_line and (width < 15 or height < 15):
                 continue
             
             # Skip full-width thin lines (borders, headers)
@@ -180,30 +185,43 @@ class ChartDetector:
     def _is_chart_cluster(self, cluster: List[Dict[str, Any]], page: fitz.Page) -> bool:
         """
         Determine if a cluster represents a chart.
-        
+
         Criteria:
         - At least min_shapes_for_chart shapes
         - Multiple different fill colors (charts use color coding)
         - Reasonable area (not too small, not page-sized)
         - Shapes are relatively close together OR completely overlapping
-        
+
+        CRITICAL FIX:
+        - Exclude simple vector charts (bar charts, line charts with simple shapes)
+        - These should be kept as vector elements, not rendered as images
+
         Args:
             cluster: List of shapes in the cluster
             page: PyMuPDF page object
-            
+
         Returns:
-            True if cluster is likely a chart
+            True if cluster is likely a chart that should be rendered as image
         """
         if len(cluster) < self.min_shapes_for_chart:
             return False
-        
+
+        # CRITICAL FIX: Check if this is a simple vector chart (should be kept as vectors)
+        # Simple vector charts have characteristics:
+        # 1. Most shapes are simple rectangles or lines
+        # 2. Limited shape complexity (no curves, paths, etc.)
+        # 3. Shapes are mostly non-overlapping (bar charts vs pie charts)
+        if self._is_simple_vector_chart(cluster):
+            logger.info(f"Detected simple vector chart (bar/line chart) - keeping as vector shapes, NOT rendering as image")
+            return False
+
         # Check color diversity (charts typically use 2+ colors)
         colors = set()
         for shape in cluster:
             fill_color = shape.get('fill_color')
             if fill_color and fill_color not in ['#FFFFFF', '#000000']:
                 colors.add(fill_color)
-        
+
         # Charts should have at least 2 distinct colors (excluding black/white)
         # EXCEPTION: Allow single-color clusters if they have large colored shapes (likely pie chart slices)
         if len(colors) < 2:
@@ -213,7 +231,7 @@ class ChartDetector:
                 shape.get('width', 0) * shape.get('height', 0) > 5000  # Large shape (>5000 pixels²)
                 for shape in cluster
             )
-            
+
             if has_large_colored_shapes:
                 logger.debug(f"Accepting single-color cluster due to large colored shapes (likely pie chart)")
             else:
@@ -249,7 +267,107 @@ class ChartDetector:
         logger.debug(f"Chart cluster validated ({cluster_type}): {len(cluster)} shapes, "
                     f"{len(colors)} colors, area={cluster_area:.0f}")
         return True
-    
+
+    def _is_simple_vector_chart(self, cluster: List[Dict[str, Any]]) -> bool:
+        """
+        Determine if a cluster is a simple vector chart that should be kept as vectors.
+
+        Simple vector charts (bar charts, line charts) have these characteristics:
+        1. Primarily composed of simple rectangles and lines (not complex paths/curves)
+        2. Shapes are mostly non-overlapping (unlike pie charts which have overlapping slices)
+        3. Contains vertical/horizontal grid lines or axis lines
+        4. Relatively low shape count (<= 30 shapes, simple bar charts don't have 100s of shapes)
+
+        Args:
+            cluster: List of shapes in the cluster
+
+        Returns:
+            True if this is a simple vector chart (should keep as vectors)
+        """
+        if len(cluster) == 0:
+            return False
+
+        # Analyze shape types in the cluster
+        shape_types = {}
+        line_count = 0
+        rect_count = 0
+        complex_shape_count = 0
+        vertical_lines = 0
+        horizontal_lines = 0
+        filled_rects = 0
+
+        for shape in cluster:
+            shape_type = shape.get('shape_type', 'unknown')
+            shape_types[shape_type] = shape_types.get(shape_type, 0) + 1
+
+            # Count lines
+            if shape_type == 'line':
+                line_count += 1
+
+                # Check if vertical or horizontal
+                x1, y1 = shape.get('x', 0), shape.get('y', 0)
+                x2, y2 = shape.get('x2', x1), shape.get('y2', y1)
+
+                # Vertical line (x coordinates similar)
+                if abs(x2 - x1) < 2:
+                    vertical_lines += 1
+                # Horizontal line (y coordinates similar)
+                elif abs(y2 - y1) < 2:
+                    horizontal_lines += 1
+
+            # Count rectangles
+            elif shape_type == 'rectangle':
+                rect_count += 1
+
+                # Check if filled (bar chart bars are usually filled)
+                if shape.get('fill_color') and shape.get('fill_color') not in ['#FFFFFF', 'None', None]:
+                    filled_rects += 1
+
+            # Count complex shapes (curves, paths, etc.)
+            elif shape_type in ['curve', 'bezier', 'path', 'circle', 'ellipse']:
+                complex_shape_count += 1
+
+        total_shapes = len(cluster)
+        simple_shapes = line_count + rect_count
+
+        # Criteria for simple vector chart:
+        # 1. Most shapes (>70%) are simple lines or rectangles
+        simple_shape_ratio = simple_shapes / total_shapes if total_shapes > 0 else 0
+
+        # 2. Has grid/axis lines (vertical or horizontal lines)
+        has_grid_lines = (vertical_lines >= 2) or (horizontal_lines >= 2)
+
+        # 3. Low complexity (few or no curves/paths)
+        low_complexity = (complex_shape_count / total_shapes < 0.3) if total_shapes > 0 else True
+
+        # 4. NOT too many shapes (simple bar charts have 5-30 shapes, not 100s)
+        reasonable_count = total_shapes <= 30
+
+        # 5. Check for bar chart pattern: filled rectangles + grid lines
+        has_bar_pattern = (filled_rects >= 1) and has_grid_lines
+
+        # Decision logic
+        is_simple = (
+            simple_shape_ratio > 0.7 and  # Mostly simple shapes
+            has_grid_lines and            # Has grid/axis lines
+            low_complexity and            # Low complexity
+            reasonable_count              # Not too many shapes
+        )
+
+        # OR explicit bar chart pattern
+        is_simple = is_simple or has_bar_pattern
+
+        if is_simple:
+            logger.debug(
+                f"Simple vector chart detected: {total_shapes} shapes, "
+                f"{simple_shapes} simple ({simple_shape_ratio:.1%}), "
+                f"{line_count} lines ({vertical_lines}V+{horizontal_lines}H), "
+                f"{rect_count} rects ({filled_rects} filled), "
+                f"{complex_shape_count} complex"
+            )
+
+        return is_simple
+
     def _is_overlapping_cluster(self, cluster: List[Dict[str, Any]]) -> bool:
         """
         Check if a cluster consists of overlapping shapes.

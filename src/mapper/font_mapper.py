@@ -58,32 +58,41 @@ class FontMapper:
     def map_font(self, pdf_font_name: str) -> str:
         """
         Map a PDF font name to PowerPoint font.
-        
+
         Args:
             pdf_font_name: Font name from PDF
-            
+
         Returns:
             Mapped PowerPoint font name
         """
         if not pdf_font_name:
+            logger.info(f"Font mapping: Input is empty, using default: {self.default_font}")
             return self.default_font
-        
+
+        logger.info(f"Font mapping: Input='{pdf_font_name}'")
+
         # Try exact match
         if pdf_font_name in self.font_map:
-            return self.font_map[pdf_font_name]
-        
+            mapped = self.font_map[pdf_font_name]
+            logger.info(f"Font mapping: Exact match → '{mapped}'")
+            return mapped
+
         # Try base font name (remove suffixes like -Bold, -Italic)
         base_font = pdf_font_name.split('-')[0].split('+')[-1]
+        logger.debug(f"Font mapping: Base font from '{pdf_font_name}' → '{base_font}'")
         if base_font in self.font_map:
-            return self.font_map[base_font]
-        
+            mapped = self.font_map[base_font]
+            logger.info(f"Font mapping: Base match → '{mapped}'")
+            return mapped
+
         # Try partial match
         for pdf_name, ppt_name in self.font_map.items():
             if pdf_name.lower() in pdf_font_name.lower():
+                logger.info(f"Font mapping: Partial match '{pdf_name}' → '{ppt_name}'")
                 return ppt_name
-        
+
         # Fall back to default
-        logger.debug(f"No mapping found for font '{pdf_font_name}', using default: {self.default_font}")
+        logger.warning(f"Font mapping: No match found for '{pdf_font_name}', using default: {self.default_font}")
         return self.default_font
     
     def is_cjk_font(self, font_name: str) -> bool:

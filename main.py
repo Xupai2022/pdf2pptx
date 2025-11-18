@@ -115,7 +115,10 @@ def convert_pdf_to_pptx(pdf_path: str, output_path: str, config: Dict[str, Any])
         logger.info("Step 3: Building Slide Models")
         logger.info("=" * 60)
         
-        mapper = CoordinateMapper(config['rebuilder'])
+        # 传递rebuilder config，同时附加完整config供FontMapper使用
+        rebuilder_config = config['rebuilder'].copy()
+        rebuilder_config['__parent__'] = config
+        mapper = CoordinateMapper(rebuilder_config)
         slide_models = []
         
         for layout_data in analyzed_pages:

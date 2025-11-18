@@ -99,88 +99,67 @@ class PDFParser:
     def _generate_page_background_without_text(self, page: fitz.Page, page_num: int) -> Optional[Dict[str, Any]]:
         """
         Generate a full-page background image without text for the given page.
-        This creates a complete page render excluding text elements.
-        
-        CRITICAL FIX: Render full page then remove text pixels using transparency.
-        Instead of masking text with opaque rectangles (which leave visible artifacts),
-        we render the complete page first, then make text pixels transparent.
-        This preserves ALL original PDF backgrounds, patterns, and styles perfectly.
-        
+        This creates a complete background render that preserves ALL visual elements
+        except text, ensuring background patterns and styles remain intact.
+
+        CRITICAL PRINCIPLE:
+        Background images should contain the complete visual design (colors, patterns,
+        shapes, images) but NO text, allowing textboxes to be placed on top.
+        When users move textboxes, the complete background remains visible.
+
+        CRITICAL FIX: Use REDACTION to remove text BEFORE rendering.
+        Instead of rendering-with-text-then-making-transparent (which loses background
+        styles that intersect with text regions), we apply redactions to remove text
+        BEFORE rendering. This preserves 100% of background patterns and styles.
+
         Strategy:
-        1. Render the full page at high resolution (includes everything)
-        2. Extract text bounding boxes to identify text regions
-        3. Make text pixels transparent by setting alpha channel to 0
-        4. Result: Complete original background with transparent "holes" where text was
-        
-        This approach avoids any visible artifacts because transparency is truly invisible,
-        while preserving all original PDF visual elements (backgrounds, patterns, shapes).
-        
+        1. Add redaction annotation covering the entire page
+        2. Apply redactions with TEXT_REMOVE but keep IMAGES and GRAPHICS
+        3. Render the page at high resolution (now without text)
+        4. Convert to PNG and save as background layer
+
+        This approach ensures 100% background fidelity - nothing is masked or removed.
+
         Args:
             page: PyMuPDF page object
             page_num: Page number for identification
-            
+
         Returns:
             Image element dictionary with z_index=-1000, or None if generation fails
         """
         try:
             rect = page.rect
-            
-            # Step 1: Extract text bounding boxes
-            text_bboxes = []
-            text_dict = page.get_text("dict")
-            for block in text_dict.get("blocks", []):
-                if block.get("type") == 0:  # Text block
-                    for line in block.get("lines", []):
-                        for span in line.get("spans", []):
-                            bbox = span.get("bbox", [0, 0, 0, 0])
-                            # Only include reasonable-sized text (filter noise)
-                            if bbox[2] - bbox[0] > 2 and bbox[3] - bbox[1] > 2:
-                                text_bboxes.append(bbox)
-            
-            logger.info(f"Page {page_num}: Found {len(text_bboxes)} text regions to make transparent")
-            
-            # Step 2: Render the full page at high resolution
+
+            # Step 1: Add redaction annotation to remove text
+            # CRITICAL: This removes text content before rendering,
+            # preserving background patterns that intersect text areas
+            page.add_redact_annot(rect)
+
+            # Step 2: Apply redactions - remove text but keep images and graphics
+            # PDF_REDACT_IMAGE_NONE: Keep all images
+            # PDF_REDACT_LINE_ART_NONE: Keep all vector graphics (shapes, lines, etc.)
+            # Default behavior removes text only
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,      # Preserve images
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE  # Preserve vector graphics
+            )
+
+            # Step 3: Render the page WITHOUT text (but with complete background)
             zoom = 2.0  # 2x for ~144 DPI from 72 DPI
             matrix = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=matrix, alpha=True)
-            
-            # Step 3: Convert to PIL Image and make text regions transparent
-            from PIL import Image, ImageDraw
-            
+
+            # Step 4: Convert to PIL Image (no masking needed!)
+            from PIL import Image
+
             # Convert pixmap to PIL Image
             img = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
-            
-            # Create an alpha mask for text regions
-            # We'll set alpha to 0 (fully transparent) for text pixels
-            alpha_mask = img.getchannel('A')  # Get current alpha channel
-            draw = ImageDraw.Draw(alpha_mask)
-            
-            # Make each text region fully transparent
-            for bbox in text_bboxes:
-                # Scale bbox coordinates by zoom factor
-                x0, y0, x2, y2 = bbox
-                x0_scaled = int(x0 * zoom)
-                y0_scaled = int(y0 * zoom)
-                x2_scaled = int(x2 * zoom)
-                y2_scaled = int(y2 * zoom)
-                
-                # Draw a black rectangle in alpha channel (0 = transparent)
-                # Add a small padding (2px) to ensure complete coverage
-                padding = 2
-                draw.rectangle(
-                    [x0_scaled - padding, y0_scaled - padding, 
-                     x2_scaled + padding, y2_scaled + padding],
-                    fill=0  # 0 = fully transparent
-                )
-            
-            # Apply the modified alpha mask back to the image
-            img.putalpha(alpha_mask)
-            
-            # Step 4: Convert back to PNG bytes
+
+            # Step 5: Convert back to PNG bytes
             img_bytes = io.BytesIO()
             img.save(img_bytes, format='PNG')
             image_bytes = img_bytes.getvalue()
-            
+
             # Create image element with lowest z-index to ensure it's at the bottom
             background_element = {
                 'type': 'image',
@@ -198,13 +177,13 @@ class PDFParser:
                 'is_background': True,
                 'z_index': -1000  # Ensure this is rendered at the bottom
             }
-            
+
             logger.info(f"Generated text-free full-page background for page {page_num} "
                        f"(size: {pix.width}x{pix.height}px, {len(image_bytes)} bytes) "
-                       f"by making {len(text_bboxes)} text regions transparent")
-            
+                       f"using redaction (preserved all background styles)")
+
             return background_element
-            
+
         except Exception as e:
             logger.error(f"Failed to generate page background for page {page_num}: {e}")
             import traceback
@@ -243,9 +222,25 @@ class PDFParser:
         total_pages = len(self.doc)
         is_first_page = (page_num == 0)
         is_last_page = (page_num == total_pages - 1)
-        
-        # For first and last pages, generate full-page background image
+
+        # CRITICAL: First/last page special rule - only background + textboxes
         if is_first_page or is_last_page:
+            logger.info(f"Page {page_num + 1}: Applying first/last page special rule - background + textboxes only")
+
+            # Step 1: Extract text blocks FIRST (before generating background)
+            # This ensures we capture text before redaction removes it
+            text_elements = self._extract_text_blocks(page)
+
+            # Filter out text elements that are icons
+            icon_indices = self.icon_detector.get_icon_text_indices(text_elements)
+            filtered_text_elements = [
+                elem for i, elem in enumerate(text_elements) if i not in icon_indices
+            ]
+
+            if icon_indices:
+                logger.info(f"Page {page_num + 1}: Filtered out {len(icon_indices)} icon font text element(s)")
+
+            # Step 2: Generate background image (using redaction, modifies page)
             background_elem = self._generate_page_background_without_text(page, page_num)
             if background_elem:
                 # Add background element with lowest z-index
@@ -254,7 +249,14 @@ class PDFParser:
                            f"({'first' if is_first_page else 'last'} page)")
             else:
                 logger.warning(f"Page {page_num + 1}: Failed to generate background layer")
-        
+
+            # Step 3: Add filtered text elements to page data
+            page_data['elements'].extend(filtered_text_elements)
+
+            logger.info(f"Page {page_num + 1}: Extracted {len(filtered_text_elements)} text elements only "
+                       f"(first/last page special rule)")
+            return page_data
+
         # Extract ExtGState opacity mapping for this page
         opacity_map = self._extract_opacity_map(page)
         
@@ -1090,7 +1092,11 @@ class PDFParser:
             # Remove redundant decorative borders (larger path borders that overlap with simpler rectangles)
             # This fixes the duplicate border issue on page 6 of season_report_del.pdf
             drawing_elements = self._remove_redundant_decorative_borders(drawing_elements)
-            
+
+            # Filter out legend container rectangles (black boxes that contain legend symbols)
+            # This fixes the issue on page 26 where chart legend is wrapped in a black rectangle
+            drawing_elements = self._filter_legend_container_rectangles(drawing_elements)
+
             # Now deduplicate overlapping shapes (removes border artifacts)
             drawing_elements = self._deduplicate_overlapping_shapes(drawing_elements)
             
@@ -1339,7 +1345,118 @@ class PDFParser:
             logger.info(f"Removed {removed_count} exact duplicate shape(s)")
         
         return unique_shapes
-    
+
+    def _filter_legend_container_rectangles(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filter out black-filled container rectangles that contain smaller legend symbols.
+
+        These are often artifact rectangles used in charting libraries to group legend items,
+        but they should not be rendered as visible black boxes in the output.
+
+        Detection criteria:
+        - Rectangle with black or very dark fill color (R,G,B all < 0.1)
+        - Has black or dark stroke (border)
+        - Contains 2+ smaller shapes inside it
+        - The smaller shapes have different colors (typical of legend symbols)
+
+        Args:
+            shapes: List of shape elements
+
+        Returns:
+            List of shapes with legend containers removed
+        """
+        if len(shapes) <= 2:
+            return shapes
+
+        filtered_shapes = []
+        skip_indices = set()
+
+        for i, container in enumerate(shapes):
+            if i in skip_indices:
+                continue
+
+            # Check if this could be a legend container
+            fill_color = container.get('fill_color')
+            stroke_color = container.get('stroke_color')
+
+            # Must have black/dark fill and stroke
+            is_black_fill = False
+            if fill_color:
+                # Parse hex color
+                if fill_color.startswith('#'):
+                    try:
+                        r = int(fill_color[1:3], 16) / 255.0
+                        g = int(fill_color[3:5], 16) / 255.0
+                        b = int(fill_color[5:7], 16) / 255.0
+                        is_black_fill = (r <= 0.1 and g <= 0.1 and b <= 0.1)
+                    except:
+                        pass
+
+            is_black_stroke = False
+            if stroke_color:
+                if stroke_color.startswith('#'):
+                    try:
+                        r = int(stroke_color[1:3], 16) / 255.0
+                        g = int(stroke_color[3:5], 16) / 255.0
+                        b = int(stroke_color[5:7], 16) / 255.0
+                        is_black_stroke = (r <= 0.1 and g <= 0.1 and b <= 0.1)
+                    except:
+                        pass
+
+            # If not a black fill+stroke rectangle, keep it
+            if not (is_black_fill and is_black_stroke):
+                filtered_shapes.append(container)
+                continue
+
+            # Get container bounds
+            cx, cy = container.get('x', 0), container.get('y', 0)
+            cw, ch = container.get('width', 0), container.get('height', 0)
+
+            # Find shapes inside this container
+            contained_shapes = []
+            for j, shape in enumerate(shapes):
+                if i == j or j in skip_indices:
+                    continue
+
+                sx, sy = shape.get('x', 0), shape.get('y', 0)
+                sw, sh = shape.get('width', 0), shape.get('height', 0)
+
+                # Check if shape is inside container (with small tolerance)
+                tolerance = 10
+                is_inside = (
+                    sx >= cx - tolerance and
+                    sy >= cy - tolerance and
+                    (sx + sw) <= (cx + cw) + tolerance and
+                    (sy + sh) <= (cy + ch) + tolerance and
+                    sw < cw and sh < ch  # Must be smaller
+                )
+
+                if is_inside:
+                    contained_shapes.append((j, shape))
+
+            # Black fill+stroke containers: filter if contains 2+ shapes with different colors
+            if len(contained_shapes) >= 2:
+                colors = set()
+                for _, shape in contained_shapes:
+                    fill = shape.get('fill_color')
+                    if fill:
+                        colors.add(fill)
+
+                if len(colors) >= 2:
+                    skip_indices.add(i)
+                    logger.debug(f"Filtered black legend container at ({cx:.1f}, {cy:.1f}), "
+                               f"size {cw:.1f}x{ch:.1f}, contains {len(contained_shapes)} shapes "
+                               f"with {len(colors)} different colors")
+                    continue
+
+            filtered_shapes.append(container)
+
+        removed_count = len(shapes) - len(filtered_shapes)
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} container rectangle(s)")
+
+        return filtered_shapes
+
     def _remove_redundant_decorative_borders(self, shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Remove redundant decorative border shapes that overlap with simpler card border rectangles.
@@ -1727,7 +1844,10 @@ class PDFParser:
         # Characteristics: 1 line item OR very thin shape with stroke but no fill
         fill = drawing.get('fill', None)
         stroke = drawing.get('color', None)
-        has_fill = fill is not None
+        fill_opacity = drawing.get('fill_opacity', 1.0)
+        # CRITICAL FIX: Check fill_opacity to detect truly transparent fills
+        # Even if fill color exists (e.g., black), if fill_opacity is 0.0, treat as no fill
+        has_fill = fill is not None and fill_opacity > 0.0
         has_stroke = stroke is not None
         
         if line_count == 1 and curve_count == 0:

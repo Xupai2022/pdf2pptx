@@ -106,25 +106,30 @@ class LayoutAnalyzerV2:
     def _should_merge_based_on_content(text1: str, text2: str, gap: float) -> tuple:
         """
         根据文本内容和间距判断是否应该合并
-        
+
         关键规则：
-        1. 如果gap <= 1pt：紧密相邻，应该合并（如"8个"）
+        0. 如果gap <= 0.5pt：超紧密相邻（几乎touching），无条件合并
+        1. 如果gap <= 2pt：紧密相邻，应该合并（如"事件&威胁总览"）
         2. 如果gap > 2pt：如果一个是纯数字，另一个是中文，则不合并（语义分隔）
         3. 如果gap > 2pt：如果一个是纯字母，另一个是中文，则不合并
         4. 如果gap > 3pt且<=10pt：只有纯中文（非数字非字母）才考虑合并
-        
+
         Args:
             text1: 第一个文本
             text2: 第二个文本
             gap: 两个文本之间的间距（pt）
-            
+
         Returns:
             (should_merge, reason) 元组
         """
-        # 规则1：紧密相邻，无条件合并
-        if gap <= 1.0:
+        # 规则0：超紧密相邻（几乎touching），无条件合并
+        if gap <= 0.5:
+            return (True, "超紧密相邻")
+
+        # 规则1：紧密相邻，无条件合并（从1pt放宽到2pt）
+        if gap <= 2.0:
             return (True, "紧密相邻")
-        
+
         # 检查内容类型
         text1_is_number = LayoutAnalyzerV2._is_purely_numeric(text1)
         text2_is_number = LayoutAnalyzerV2._is_purely_numeric(text2)
@@ -132,29 +137,40 @@ class LayoutAnalyzerV2:
         text2_is_alpha = LayoutAnalyzerV2._is_purely_alphabetic(text2)
         text1_has_cjk = LayoutAnalyzerV2._has_cjk_characters(text1)
         text2_has_cjk = LayoutAnalyzerV2._has_cjk_characters(text2)
+        text1_is_whitespace = text1.isspace()
+        text2_is_whitespace = text2.isspace()
+
+        # 规则0.5：如果任意一侧是纯空格，且gap <= 5pt，应该合并
+        # 这允许"变更 " + " " + "34"这样的序列正确合并
+        if (text1_is_whitespace or text2_is_whitespace) and gap <= 5.0:
+            return (True, "含空格字符")
         
-        # 规则2：纯数字 + 中文，且gap > 2pt，不合并（解决"44 起服务外"重叠问题）
-        if gap > 2.0:
+        # 规则2：纯数字 + 中文，且gap > 5pt，不合并（放宽从2pt到5pt）
+        # 解决"44 起服务外"重叠问题，但允许"变更 34 次"合并（gap=3.5pt）
+        if gap > 5.0:
             if (text1_is_number and text2_has_cjk) or (text1_has_cjk and text2_is_number):
                 return (False, f"数字与中文分隔")
-            
-            # 规则3：纯字母 + 中文，且gap > 2pt，不合并
+
+            # 规则3：纯字母 + 中文，且gap > 5pt，不合并
             if (text1_is_alpha and text2_has_cjk) or (text1_has_cjk and text2_is_alpha):
                 return (False, f"字母与中文分隔")
         
-        # 规则4：中等间距（1-3pt），只有相同类型才合并
-        if 1.0 < gap <= 3.0:
+        # 规则4：中等间距（2-5pt），根据内容类型判断
+        if 2.0 < gap <= 5.0:
             # 如果两个都是中文（非数字），可以合并
             if text1_has_cjk and text2_has_cjk and not text1_is_number and not text2_is_number:
                 return (True, "中文连续")
             # 如果两个都是数字，可以合并
             if text1_is_number and text2_is_number:
                 return (True, "数字连续")
+            # 中文+数字，且gap<=5pt，也应该合并（如"变更 34 次"）
+            if (text1_has_cjk and text2_is_number) or (text1_is_number and text2_has_cjk):
+                return (True, "中文数字组合")
             # 其他情况不合并
             return (False, "内容类型不同")
         
-        # 规则5：较大间距（>3pt），默认不合并，除非是纯中文词组
-        if gap > 3.0:
+        # 规则5：较大间距（>5pt），默认不合并，除非是纯中文词组
+        if gap > 5.0:
             # 只有纯中文（非数字非字母）才考虑合并
             if (text1_has_cjk and not text1_is_number and not text1_is_alpha and
                 text2_has_cjk and not text2_is_number and not text2_is_alpha):
@@ -516,12 +532,33 @@ class LayoutAnalyzerV2:
                         # First check style compatibility
                         # 放宽颜色匹配：允许相近的颜色（如#000000和#14161A）
                         colors_match = LayoutAnalyzerV2._colors_similar(other_color, elem_color, threshold=30)
+
+                        # 特殊处理：如果任意一侧是纯空格，忽略颜色检查（空格不可见，颜色无关紧要）
+                        # 这解决了"变更 " + " " + "34 次"的合并问题（空格的颜色可能与相邻文本不同）
+                        is_space_involved = elem_text.isspace() or other_text.isspace()
+
+                        # 特殊处理：如果gap非常小(<= 1pt)且涉及数字，也忽略颜色检查
+                        # 这解决了"变更 34 次"中数字颜色不同(红色)但应该在同一文本框的问题
+                        elem_is_number = LayoutAnalyzerV2._is_purely_numeric(elem_text)
+                        other_is_number = LayoutAnalyzerV2._is_purely_numeric(other_text)
+                        is_tight_number = (abs(x_gap) <= 1.0 and (elem_is_number or other_is_number))
+
+                        # 放宽样式检查：只要求颜色相近和字号接近，允许不同字体（如中文+符号+数字）
+                        # 但如果涉及空格或紧密相邻的数字，则忽略颜色要求
                         style_compatible = (
                             abs(other_font_size - elem_font_size) <= 2 and
-                            colors_match and
-                            same_style
+                            (colors_match or is_space_involved or is_tight_number)
+                            # 移除same_style检查，允许不同字体的同行文本合并
                         )
-                        
+
+                        # Debug logging for style incompatibility
+                        if not style_compatible and (elem_text.isspace() or other_text.isspace() or
+                                                     '变更' in elem_text or '变更' in other_text or
+                                                     elem_text == '34' or other_text == '34'):
+                            logger.warning(f"[STYLE] Style incompatible: '{elem_text}' (size={elem_font_size}, color={elem_color}) + "
+                                         f"'{other_text}' (size={other_font_size}, color={other_color}), "
+                                         f"size_diff={abs(other_font_size - elem_font_size):.1f}, colors_match={colors_match}")
+
                         if style_compatible:
                             # Use absolute value of gap for content analysis
                             merge_result = self._should_merge_based_on_content(
@@ -537,13 +574,24 @@ class LayoutAnalyzerV2:
                         if left_gap >= -1.0:
                             elem_text = elem.get('content', '')
                             other_text = other.get('content', '')
-                            
+
                             # 放宽颜色匹配：允许相近的颜色（如#000000和#14161A）
                             colors_match = LayoutAnalyzerV2._colors_similar(other_color, elem_color, threshold=30)
+
+                            # 特殊处理：如果任意一侧是纯空格，忽略颜色检查（空格不可见，颜色无关紧要）
+                            is_space_involved = elem_text.isspace() or other_text.isspace()
+
+                            # 特殊处理：如果gap非常小(<= 1pt)且涉及数字，也忽略颜色检查
+                            elem_is_number = LayoutAnalyzerV2._is_purely_numeric(elem_text)
+                            other_is_number = LayoutAnalyzerV2._is_purely_numeric(other_text)
+                            is_tight_number = (abs(left_gap) <= 1.0 and (elem_is_number or other_is_number))
+
+                            # 放宽样式检查：只要求颜色相近和字号接近，允许不同字体（如中文+符号+数字）
+                            # 但如果涉及空格或紧密相邻的数字，则忽略颜色要求
                             style_compatible = (
                                 abs(other_font_size - elem_font_size) <= 2 and
-                                colors_match and
-                                same_style
+                                (colors_match or is_space_involved or is_tight_number)
+                                # 移除same_style检查，允许不同字体的同行文本合并
                             )
                             
                             if style_compatible:
@@ -559,13 +607,31 @@ class LayoutAnalyzerV2:
                         current_x2 = max(current_x2, other_x2)
                         
                         # Log merging decisions for debugging
-                        if abs(actual_gap) > 2.0:
-                            logger.debug(f"Merging '{elem.get('content', '')}' + '{other.get('content', '')}' "
+                        elem_content = elem.get('content', '')
+                        other_content = other.get('content', '')
+
+                        # Special logging for whitespace or number merging
+                        if (elem_content.isspace() or other_content.isspace() or
+                            '变更' in elem_content or '变更' in other_content or
+                            elem_content == '34' or other_content == '34'):
+                            logger.info(f"[WHITESPACE/NUMBER] Merging '{elem_content}' + '{other_content}' "
+                                       f"(gap={actual_gap:.2f}pt, reason={merge_reason})")
+                        elif abs(actual_gap) > 2.0:
+                            logger.debug(f"Merging '{elem_content}' + '{other_content}' "
                                        f"(gap={actual_gap:.2f}pt, reason={merge_reason})")
                     else:
                         # Log when we skip merging for interesting cases
-                        if 2.0 < abs(x_gap) <= 10.0 and merge_reason:
-                            logger.debug(f"Not merging '{elem.get('content', '')}' + '{other.get('content', '')}' "
+                        elem_content = elem.get('content', '')
+                        other_content = other.get('content', '')
+
+                        # Special logging for whitespace or number merging failures
+                        if (elem_content.isspace() or other_content.isspace() or
+                            '变更' in elem_content or '变更' in other_content or
+                            elem_content == '34' or other_content == '34'):
+                            logger.warning(f"[WHITESPACE/NUMBER] NOT merging '{elem_content}' + '{other_content}' "
+                                          f"(gap={x_gap:.2f}pt, reason={merge_reason})")
+                        elif 2.0 < abs(x_gap) <= 10.0 and merge_reason:
+                            logger.debug(f"Not merging '{elem_content}' + '{other_content}' "
                                        f"(gap={x_gap:.2f}pt, reason={merge_reason})")
             
             # Create region
@@ -616,9 +682,146 @@ class LayoutAnalyzerV2:
                 'text': text_content,
                 'z_index': 20000  # Text should appear on top of shapes and images
             })
-        
+
+        # 第二步：合并垂直方向的段落文本
+        # 暂时禁用：此功能会错误地合并同一行但不同X坐标的文本
+        # 例如："威胁监测响应"与下方同名文本合并，而忽略了右侧的"/ 事件&威胁总览"
+        # regions = self._merge_paragraph_regions(regions)
+
         return regions
-    
+
+    def _merge_paragraph_regions(self, regions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        合并垂直方向上的段落文本（多行合并为单个文本框）
+
+        判断标准：
+        1. 相同或相近的左边界（左对齐，允许5pt误差）
+        2. 行间距 < 字号 × 1.5（正常行距范围）
+        3. 相同角色（role）和相近样式
+        4. 不是标题、表格等特殊内容
+
+        Args:
+            regions: 已经过水平合并的文本区域列表
+
+        Returns:
+            合并后的文本区域列表
+        """
+        if not regions:
+            return []
+
+        # 按Y坐标排序
+        sorted_regions = sorted(regions, key=lambda r: r['bbox'][1])
+
+        merged_regions = []
+        processed = set()
+
+        for i, region in enumerate(sorted_regions):
+            if i in processed:
+                continue
+
+            # 不合并标题、表格等特殊内容
+            role = region.get('role', 'text')
+            if role in ['title', 'subtitle', 'header', 'footer']:
+                merged_regions.append(region)
+                processed.add(i)
+                continue
+
+            # 获取当前region的信息
+            bbox = region['bbox']  # [x1, y1, x2, y2]
+            left_x = bbox[0]
+            right_x = bbox[2]
+            bottom_y = bbox[3]
+            elements = region.get('elements', [])
+
+            # 获取字号（用于计算行距）
+            avg_font_size = sum(e.get('font_size', 12) for e in elements) / len(elements) if elements else 12
+            max_line_spacing = avg_font_size * 1.5  # 正常行距阈值
+
+            # 尝试寻找下方的段落行
+            paragraph_regions = [region]
+            paragraph_indices = [i]
+
+            for j in range(i + 1, len(sorted_regions)):
+                if j in processed:
+                    continue
+
+                next_region = sorted_regions[j]
+                next_role = next_region.get('role', 'text')
+                next_bbox = next_region['bbox']
+                next_left_x = next_bbox[0]
+                next_top_y = next_bbox[1]
+                next_elements = next_region.get('elements', [])
+
+                # 检查1：角色必须是普通文本
+                if next_role not in ['text', 'body']:
+                    break
+
+                # 检查2：左对齐（允许5pt误差）
+                left_alignment_tolerance = 5.0
+                if abs(next_left_x - left_x) > left_alignment_tolerance:
+                    break
+
+                # 检查3：行间距（当前region底部到下一region顶部的距离）
+                line_gap = next_top_y - bottom_y
+                if line_gap < 0 or line_gap > max_line_spacing:
+                    break
+
+                # 检查4：字号相近（允许2pt差异）
+                next_avg_font_size = sum(e.get('font_size', 12) for e in next_elements) / len(next_elements) if next_elements else 12
+                if abs(next_avg_font_size - avg_font_size) > 2:
+                    break
+
+                # 检查5：颜色相近
+                # 获取主要颜色（第一个元素的颜色）
+                current_color = elements[0].get('color', '#000000') if elements else '#000000'
+                next_color = next_elements[0].get('color', '#000000') if next_elements else '#000000'
+                if not LayoutAnalyzerV2._colors_similar(current_color, next_color, threshold=30):
+                    break
+
+                # 符合条件，加入段落
+                paragraph_regions.append(next_region)
+                paragraph_indices.append(j)
+                bottom_y = next_bbox[3]  # 更新底部边界
+
+            # 如果找到多行段落，合并它们
+            if len(paragraph_regions) > 1:
+                # 合并所有elements
+                merged_elements = []
+                text_lines = []
+
+                for para_region in paragraph_regions:
+                    merged_elements.extend(para_region.get('elements', []))
+                    text_lines.append(para_region.get('text', ''))
+
+                # 用换行符连接文本
+                merged_text = '\n'.join(text_lines)
+
+                # 计算合并后的bbox
+                merged_bbox = self._calculate_bbox(merged_elements)
+
+                # 创建合并后的region
+                merged_region = {
+                    'role': role,
+                    'bbox': merged_bbox,
+                    'elements': merged_elements,
+                    'text': merged_text,
+                    'z_index': region.get('z_index', 20000)
+                }
+
+                merged_regions.append(merged_region)
+
+                # 标记所有参与合并的region为已处理
+                for idx in paragraph_indices:
+                    processed.add(idx)
+
+                logger.debug(f"Merged {len(paragraph_regions)} lines into paragraph: {merged_text[:50]}...")
+            else:
+                # 单行，直接添加
+                merged_regions.append(region)
+                processed.add(i)
+
+        return merged_regions
+
     def _calculate_bbox(self, elements: List[Dict[str, Any]]) -> List[float]:
         """
         Calculate bounding box for a list of elements.
